@@ -1,0 +1,21 @@
+[package]
+name = "cvsd-extractor"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "cvsd_extractor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cvsd_extractor"
+path = "src/main.rs"
+
+[dependencies]
+hound = "3"
+argh = "0.1"
+anyhow = "1"
+rubato = "1.0.1"
+audioadapter-buffers = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
