@@ -4,7 +4,62 @@ use anyhow::{Context, Result, bail};
 
 use crate::cvsd_chip::CvsdChip;
 
-/// The three ROM chips on the WPC89 sound board.
+// ---------------------------------------------------------------------------
+// ROM header table-pointer offsets
+// ---------------------------------------------------------------------------
+//
+// The WPC-89 sound firmware stores a block of 16-bit big-endian pointers at
+// the base of the default banked ROM page (6809 address 0x4000+).  Each
+// pointer references a data table elsewhere in the same ROM page.
+//
+// These offsets are relative to the default bank base (i.e. add to the file
+// position of address 0x4000 in the system bank).
+//
+// Source: decompiled firmware BL_U18.L1, ROM header comments and usage in
+//         start_cvsd_sample(), sound_command_handler(), process_wpc_command_buffer().
+
+/// Pointer to FM patch / instrument table (26 bytes per patch).
+pub const ROM_HDR_FM_PATCH_TABLE: usize = 0x01;
+/// Pointer to DAC (raw PCM) sample table.
+pub const ROM_HDR_DAC_SAMPLE_TABLE: usize = 0x03;
+/// Pointer to FM program-change table.
+pub const ROM_HDR_FM_PROGRAM_TABLE: usize = 0x05;
+/// Pointer to voice-type table (command → FM channel bitmask + CVSD flag).
+pub const ROM_HDR_VOICE_TYPE_TABLE: usize = 0x07;
+/// Maximum valid sound-command index (1 byte, NOT a pointer).
+pub const ROM_HDR_MAX_CMD_INDEX: usize = 0x0E;
+/// Pointer to command dispatch table (command → handler_id + param, 2 bytes each).
+pub const ROM_HDR_CMD_DISPATCH_TABLE: usize = 0x0F;
+/// Pointer to sound-program table (command → sequence-data pointers).
+pub const ROM_HDR_SOUND_PROGRAM_TABLE: usize = 0x11;
+/// Pointer to CVSD compressed-sample table.
+pub const ROM_HDR_CVSD_SAMPLE_TABLE: usize = 0x15;
+
+// ---------------------------------------------------------------------------
+// Bank selector constants
+// ---------------------------------------------------------------------------
+//
+// The bank register at I/O address 0x2000 uses **active-low chip-enable**
+// signals in bits [7:5] to select one of three ROM sockets, plus a 5-bit
+// page number in bits [4:0]:
+//
+//   bit 7 low  →  U18 selected   (bits [7:5] = 011  →  masked value 0x60)
+//   bit 6 low  →  U15 selected   (bits [7:5] = 101  →  masked value 0xA0)
+//   bit 5 low  →  U14 selected   (bits [7:5] = 110  →  masked value 0xC0)
+//
+// Source: decompiled firmware ROM-checksum routine and FIRQ ISR bank restore.
+
+/// Chip-enable mask: the top three bits of the bank selector.
+const CHIP_ENABLE_MASK: u8 = 0xE0;
+/// Bank-number mask: the lower five bits of the bank selector.
+const BANK_NUMBER_MASK: u8 = 0x1F;
+
+/// Default / system bank selector for U18.  Written to 0x2000 at the end of
+/// every FIRQ to restore access to the ROM header and sequencer tables.
+/// Encodes U18 chip-enable (0x60) + page 0x1C.
+pub const SYSTEM_BANK: u8 = 0x7C;
+
+/// The three ROM chips on the WPC-89 sound board.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RomChip {
     U14,
@@ -13,12 +68,23 @@ pub enum RomChip {
 }
 
 /// A single decoded CVSD audio entry from the ROM table.
+///
+/// Each entry in the CVSD sample table is a 5-byte record:
+///
+/// | Offset | Size | Field                                              |
+/// |--------|------|----------------------------------------------------|
+/// | +0     | 1    | Bank selector (written to 0x2000 to page in data)  |
+/// | +1     | 2    | Start address of CVSD data (big-endian, 0x4000+)   |
+/// | +3     | 2    | End address of CVSD data (big-endian, exclusive)    |
+///
+/// The sample table itself is a list of 16-bit pointers to these records,
+/// indexed by a 7-bit sample number from the voice sequencer.
 pub struct CvsdEntry {
     /// Which ROM chip the audio data lives in.
     pub chip: RomChip,
-    /// ROM bank number (bits 0–4 of the bank selector byte).
+    /// ROM bank number (bits [4:0] of the bank selector byte).
     pub bank: u8,
-    /// Byte offset in the ROM file.
+    /// Byte offset of the CVSD data in the ROM file.
     pub offset: usize,
     /// Number of bytes of CVSD data.
     pub size: usize,
@@ -44,14 +110,18 @@ impl RomSet {
 }
 
 /// Decode the bank selector byte into a chip identifier and bank number.
+///
+/// Bits [7:5] carry active-low chip-enable signals; bits [4:0] hold the
+/// 32 KB page number within the selected chip.  Returns `None` if the
+/// chip-enable pattern does not match any known ROM socket.
 fn decode_bank_selector(bank_selector: u8) -> Option<(RomChip, u8)> {
-    let chip = match bank_selector & 0xe0 {
-        0xc0 => RomChip::U14,
-        0xa0 => RomChip::U15,
+    let chip = match bank_selector & CHIP_ENABLE_MASK {
+        0xC0 => RomChip::U14,
+        0xA0 => RomChip::U15,
         0x60 => RomChip::U18,
         _ => return None,
     };
-    let bank = bank_selector & 0x1f;
+    let bank = bank_selector & BANK_NUMBER_MASK;
     Some((chip, bank))
 }
 
@@ -60,28 +130,98 @@ fn read_be_u16(data: &[u8], pos: usize) -> u16 {
     u16::from_be_bytes([data[pos], data[pos + 1]])
 }
 
-/// Parse the CVSD entry table from the u18 ROM and return all entries.
+// ---------------------------------------------------------------------------
+// RomHeader — parsed firmware table pointers
+// ---------------------------------------------------------------------------
+
+/// Parsed header pointers from the WPC-89 sound ROM.
+///
+/// All pointer fields are raw 6809 addresses (in the 0x4000–0xBFFF banked
+/// window).  They can be converted to file offsets by subtracting 0x4000 and
+/// adding [`system_bank_offset`].
+///
+/// This struct is cheap to construct and provides a typed view over the
+/// ROM header so that downstream code (CVSD extraction, sound program
+/// parsing, etc.) can share a single parsed representation.
+#[derive(Debug, Clone)]
+pub struct RomHeader {
+    /// File offset of the system bank (U18 page 0x1C).
+    pub system_bank_file: usize,
+    /// 6809 address of the FM patch table.
+    pub fm_patch_table: u16,
+    /// 6809 address of the DAC sample table.
+    pub dac_sample_table: u16,
+    /// 6809 address of the FM program-change table.
+    pub fm_program_table: u16,
+    /// 6809 address of the voice-type table.
+    pub voice_type_table: u16,
+    /// Maximum valid sound-command index.
+    pub max_cmd_index: u8,
+    /// 6809 address of the command dispatch table.
+    pub cmd_dispatch_table: u16,
+    /// 6809 address of the sound-program table.
+    pub sound_program_table: u16,
+    /// 6809 address of the CVSD sample table.
+    pub cvsd_sample_table: u16,
+}
+
+impl RomHeader {
+    /// Parse a [`RomHeader`] from raw U18 ROM data.
+    pub fn from_u18(u18_data: &[u8]) -> Result<Self> {
+        let sbf = system_bank_offset(u18_data.len())
+            .context("U18 ROM is too small (need at least 0x20000 bytes)")?;
+
+        Ok(Self {
+            system_bank_file: sbf,
+            fm_patch_table: read_be_u16(u18_data, sbf + ROM_HDR_FM_PATCH_TABLE),
+            dac_sample_table: read_be_u16(u18_data, sbf + ROM_HDR_DAC_SAMPLE_TABLE),
+            fm_program_table: read_be_u16(u18_data, sbf + ROM_HDR_FM_PROGRAM_TABLE),
+            voice_type_table: read_be_u16(u18_data, sbf + ROM_HDR_VOICE_TYPE_TABLE),
+            max_cmd_index: u18_data[sbf + ROM_HDR_MAX_CMD_INDEX],
+            cmd_dispatch_table: read_be_u16(u18_data, sbf + ROM_HDR_CMD_DISPATCH_TABLE),
+            sound_program_table: read_be_u16(u18_data, sbf + ROM_HDR_SOUND_PROGRAM_TABLE),
+            cvsd_sample_table: read_be_u16(u18_data, sbf + ROM_HDR_CVSD_SAMPLE_TABLE),
+        })
+    }
+
+    /// Convert a 6809 banked-ROM address (0x4000–0xBFFF) to a U18 file offset.
+    pub fn to_file_offset(&self, addr: u16) -> usize {
+        (addr as usize) - 0x4000 + self.system_bank_file
+    }
+}
+
+/// Parse the CVSD entry table from the U18 ROM and return all entries.
+///
+/// The CVSD sample table pointer lives at ROM address 0x4015 (offset
+/// [`ROM_HDR_CVSD_SAMPLE_TABLE`] into the default bank page).  It points to
+/// a list of 16-bit pointers, each referencing a 5-byte sample descriptor.
+///
+/// The firmware indexes this table with a 7-bit sample number from the voice
+/// sequencer (function `start_cvsd_sample` in the decompiled firmware).
+/// For offline extraction we simply iterate until we hit an invalid entry.
 pub fn parse_cvsd_table(roms: &RomSet) -> Result<Vec<CvsdEntry>> {
     let u18_data = std::fs::read(&roms.u18)
         .with_context(|| format!("failed to read u18 ROM: {}", roms.u18.display()))?;
 
     let u18_size = u18_data.len();
-    // The system ROM occupies the last 0x20000 bytes of the u18 image.
+
+    // The system bank (0x7C = U18 page 0x1C) is always the default. Its file
+    // offset equals `u18_size - 0x20000`, which works for any ROM size because
+    // bank 0x1C sits exactly 0x20000 bytes from the end of the U18 image.
     if u18_size < 0x20000 {
         bail!(
             "u18 ROM is too small ({} bytes); expected at least 0x20000",
             u18_size
         );
     }
-    let u18_rom_offset = u18_size - 0x20000;
+    let system_bank_file = u18_size - 0x20000;
 
-    // The CVSD table pointer is a 16-bit big-endian value stored at ROM-relative
-    // address 0x4015, which maps to file offset `u18_rom_offset + 0x15`.
-    let table_ptr_file = u18_rom_offset + 0x15;
+    // Read the CVSD table pointer from the ROM header.
+    let table_ptr_file = system_bank_file + ROM_HDR_CVSD_SAMPLE_TABLE;
     let cvsd_table_ptr_raw = read_be_u16(&u18_data, table_ptr_file) as usize;
 
-    // Convert from 6809 address space (0x4000-based) to file offset.
-    let cvsd_table_file = cvsd_table_ptr_raw - 0x4000 + u18_rom_offset;
+    // Convert from 6809 banked-ROM address (0x4000-based) to file offset.
+    let cvsd_table_file = cvsd_table_ptr_raw - 0x4000 + system_bank_file;
 
     let mut entries = Vec::new();
     let mut counter = 0usize;
@@ -95,7 +235,7 @@ pub fn parse_cvsd_table(roms: &RomSet) -> Result<Vec<CvsdEntry>> {
         let entry_ptr_raw = read_be_u16(&u18_data, entry_ptr_pos) as usize;
         let entry_file = entry_ptr_raw
             .wrapping_sub(0x4000)
-            .wrapping_add(u18_rom_offset);
+            .wrapping_add(system_bank_file);
 
         if entry_file + 5 > u18_data.len() {
             break;
@@ -120,12 +260,19 @@ pub fn parse_cvsd_table(roms: &RomSet) -> Result<Vec<CvsdEntry>> {
             RomChip::U18 => u18_size,
         };
 
-        // Convert bank+address to a raw file offset.
-        // Formula from the Python extractor:
-        //   offset = rom_bank * 0x8000 - (0x100000 - rom_size) + data_start - 0x4000
+        // Convert bank number + 6809 address to a raw file offset.
+        //
+        // The WPC-89 maps 32 KB ROM pages into the 6809 address range
+        // 0x4000–0xBFFF.  Each ROM chip supports up to 32 pages (512 KB).
+        // The mapping uses active-low chip enables, so the highest-numbered
+        // pages sit at the *end* of the ROM image file.
+        //
+        //   file_offset = bank * 0x8000          — page start within a 1 MB address space
+        //               - (0x100000 - rom_size)  — adjust for ROMs smaller than 1 MB
+        //               + data_start - 0x4000    — offset within the 32 KB page
         //
         // The intermediate result can be negative for small banks with small ROMs,
-        // so we use i64 arithmetic here to avoid usize underflow/overflow.
+        // so we use i64 arithmetic to avoid usize underflow.
         let offset_i64 = (bank as i64) * 0x8000
             + rom_size as i64
             - 0x100000
@@ -164,8 +311,12 @@ pub fn parse_cvsd_table(roms: &RomSet) -> Result<Vec<CvsdEntry>> {
 
 /// Decode a CVSD entry to a vector of signed 8-bit PCM samples.
 ///
-/// Bits within each byte are read LSB-first (little-endian bit order),
-/// matching the Python `bitarray(endian='little')` behaviour.
+/// The FIRQ ISR in the firmware outputs CVSD bits **LSB-first**: the current
+/// data byte is written directly (bit 0 → HC55536 data-in on rising clock),
+/// then shifted right for subsequent bits (bit 1, 2, …, 7).  After 8 bits
+/// a new byte is loaded.  We replicate this order here.
+///
+/// See `VEC_FIRQ_ISR` in the decompiled firmware (BL_U18.L1.c, lines 263-362).
 pub fn decode_entry(entry: &CvsdEntry, roms: &RomSet) -> Result<Vec<i8>> {
     let rom_path = match entry.chip {
         RomChip::U14 => &roms.u14,
@@ -210,5 +361,24 @@ pub fn chip_name(chip: RomChip) -> &'static str {
         RomChip::U14 => "u14",
         RomChip::U15 => "u15",
         RomChip::U18 => "u18",
+    }
+}
+
+/// Read a 16-bit big-endian pointer from a ROM header table.
+///
+/// `header_offset` is one of the `ROM_HDR_*` constants.
+/// Returns the raw 6809 address stored at that location.
+pub fn read_rom_header_ptr(u18_data: &[u8], system_bank_file: usize, header_offset: usize) -> u16 {
+    read_be_u16(u18_data, system_bank_file + header_offset)
+}
+
+/// Compute the file offset of the system bank (U18 page 0x1C) within a U18 ROM.
+///
+/// The system bank always occupies the last 0x20000 bytes of the U18 image.
+pub fn system_bank_offset(u18_size: usize) -> Option<usize> {
+    if u18_size >= 0x20000 {
+        Some(u18_size - 0x20000)
+    } else {
+        None
     }
 }

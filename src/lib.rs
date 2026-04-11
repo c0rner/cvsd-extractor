@@ -1,4 +1,5 @@
 pub mod cvsd_chip;
+pub mod sound_program;
 pub mod wav;
 pub mod wpc89;
 
