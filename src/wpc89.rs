@@ -274,11 +274,8 @@ pub fn parse_cvsd_table(roms: &RomSet) -> Result<Vec<CvsdEntry>> {
         //
         // The intermediate result can be negative for small banks with small ROMs,
         // so we use i64 arithmetic to avoid usize underflow.
-        let offset_i64 = (bank as i64) * 0x8000
-            + rom_size as i64
-            - 0x100000
-            + cvsd_data_start as i64
-            - 0x4000;
+        let offset_i64 =
+            (bank as i64) * 0x8000 + rom_size as i64 - 0x100000 + cvsd_data_start as i64 - 0x4000;
 
         if offset_i64 < 0 {
             counter += 1;

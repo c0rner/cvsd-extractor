@@ -86,8 +86,7 @@ impl CvsdChip {
         // 5. Capture the sample at this pipeline stage.
         //    Scale 10-bit signed (-512..511) → 16-bit signed (-32768..32767)
         //    using the same formula as the C reference.
-        let sample16 = (self.integrator << 6)
-            | (((self.integrator & 0x3FF) ^ 0x200) >> 4);
+        let sample16 = (self.integrator << 6) | (((self.integrator & 0x3FF) ^ 0x200) >> 4);
         // Take the top 8 bits of the 16-bit value → i8 range, no compression needed.
         self.last_sample = (sample16 >> 8) as i8;
 
@@ -116,4 +115,3 @@ impl Default for CvsdChip {
         Self::new()
     }
 }
-

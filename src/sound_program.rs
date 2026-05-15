@@ -249,63 +249,59 @@ impl SeqOpcode {
     fn operand_info(self) -> (usize, Option<usize>, NextOp) {
         use SeqOpcode::*;
         match self {
-            EndOfSequence          => (1, None, NextOp::Terminal),
-            Nop                    => (0, None, NextOp::Terminal),
-            CvsdSampleStartStereo  => (4, None, NextOp::Embedded),
-            CvsdSampleStart        => (3, None, NextOp::Embedded),
-            TimingAdvance          => (3, Some(4), NextOp::Embedded),
-            NoteOnTiming           => (2, Some(3), NextOp::Embedded),
-            FmPatchLoad            => (2, None, NextOp::Embedded),
-            PushPitchTable
-            | PushPitchTableAlt    => (2, None, NextOp::Embedded),
-            RepeatLoop
-            | RepeatLoopAlt        => (1, None, NextOp::Embedded),
-            SetAbsolutePitch       => (2, None, NextOp::Embedded),
-            TriggerSubSound        => (2, None, NextOp::Embedded),
-            GapNop11
-            | GapNop16
-            | GapNop20             => (0, None, NextOp::Terminal),
-            InjectCmdRerun         => (1, None, NextOp::Terminal),
-            SubroutineCall         => (2, None, NextOp::Branch),
-            SubroutineReturn       => (0, None, NextOp::Branch),
-            FmKeyOff               => (0, None, NextOp::Terminal),
-            CvsdFmNoteOnAbs        => (3, None, NextOp::Embedded),
-            CvsdVoiceUpdate        => (3, None, NextOp::Embedded),
-            CvsdFmNoteOnDelta      => (3, None, NextOp::Embedded),
-            CvsdVibrato            => (5, None, NextOp::Embedded),
-            Detune                 => (3, None, NextOp::Embedded),
-            NoteTimingCombined     => (2, Some(3), NextOp::Embedded),
-            PitchGlide             => (11, None, NextOp::Embedded),
-            StopDacCvsd            => (0, None, NextOp::Terminal),
-            CvsdVolumeFade         => (2, None, NextOp::Embedded),
-            SendStatusToCpu        => (2, None, NextOp::Embedded),
-            SetChannelTiming       => (3, None, NextOp::Embedded),
-            FmKeyOnWithTiming      => (1, None, NextOp::Embedded),
-            AddTimingDelta         => (3, None, NextOp::Embedded),
-            FmPitchDeltaTableB     => (3, None, NextOp::Embedded),
-            FmPitchDeltaTableA     => (3, None, NextOp::Embedded),
-            FmPitchAbsTableB       => (3, None, NextOp::Embedded),
-            FmPitchAbsTableA       => (3, None, NextOp::Embedded),
-            GlobalPitchSlideHi     => (3, None, NextOp::Embedded),
-            GlobalPitchSlideLo     => (3, None, NextOp::Embedded),
-            SetGlobalPitchAbsHi    => (3, None, NextOp::Embedded),
-            SetGlobalPitchAbsLo    => (3, None, NextOp::Embedded),
-            NoteTriggerRepeat      => (5, None, NextOp::Embedded),
-            SetStereoMask          => (1, None, NextOp::Embedded),
-            ClearChannelMask       => (1, None, NextOp::Embedded),
-            IndirectOpcodeLoad     => (2, None, NextOp::Branch),
-            InjectCmdRingBuf       => (2, None, NextOp::Embedded),
-            CvsdSamplePlayback     => (2, None, NextOp::Embedded),
-            TimingAdvanceAlt       => (2, Some(3), NextOp::Embedded),
-            ProgramChange          => (3, None, NextOp::Embedded),
-            PushPitchTable4b       => (4, None, NextOp::Embedded),
-            SetVolumeAbs           => (2, None, NextOp::Embedded),
-            VolumeFadeRel          => (2, None, NextOp::Embedded),
-            FmKeyOnComplex         => (2, Some(3), NextOp::Embedded),
-            UpdateNoteRegister     => (2, None, NextOp::Embedded),
-            NoteRegisterDelta      => (2, None, NextOp::Embedded),
-            FreeVoiceEnd           => (0, None, NextOp::Terminal),
-            SetBankSwitch          => (2, None, NextOp::Embedded),
+            EndOfSequence => (1, None, NextOp::Terminal),
+            Nop => (0, None, NextOp::Terminal),
+            CvsdSampleStartStereo => (4, None, NextOp::Embedded),
+            CvsdSampleStart => (3, None, NextOp::Embedded),
+            TimingAdvance => (3, Some(4), NextOp::Embedded),
+            NoteOnTiming => (2, Some(3), NextOp::Embedded),
+            FmPatchLoad => (2, None, NextOp::Embedded),
+            PushPitchTable | PushPitchTableAlt => (2, None, NextOp::Embedded),
+            RepeatLoop | RepeatLoopAlt => (1, None, NextOp::Embedded),
+            SetAbsolutePitch => (2, None, NextOp::Embedded),
+            TriggerSubSound => (2, None, NextOp::Embedded),
+            GapNop11 | GapNop16 | GapNop20 => (0, None, NextOp::Terminal),
+            InjectCmdRerun => (1, None, NextOp::Terminal),
+            SubroutineCall => (2, None, NextOp::Branch),
+            SubroutineReturn => (0, None, NextOp::Branch),
+            FmKeyOff => (0, None, NextOp::Terminal),
+            CvsdFmNoteOnAbs => (3, None, NextOp::Embedded),
+            CvsdVoiceUpdate => (3, None, NextOp::Embedded),
+            CvsdFmNoteOnDelta => (3, None, NextOp::Embedded),
+            CvsdVibrato => (5, None, NextOp::Embedded),
+            Detune => (3, None, NextOp::Embedded),
+            NoteTimingCombined => (2, Some(3), NextOp::Embedded),
+            PitchGlide => (11, None, NextOp::Embedded),
+            StopDacCvsd => (0, None, NextOp::Terminal),
+            CvsdVolumeFade => (2, None, NextOp::Embedded),
+            SendStatusToCpu => (2, None, NextOp::Embedded),
+            SetChannelTiming => (3, None, NextOp::Embedded),
+            FmKeyOnWithTiming => (1, None, NextOp::Embedded),
+            AddTimingDelta => (3, None, NextOp::Embedded),
+            FmPitchDeltaTableB => (3, None, NextOp::Embedded),
+            FmPitchDeltaTableA => (3, None, NextOp::Embedded),
+            FmPitchAbsTableB => (3, None, NextOp::Embedded),
+            FmPitchAbsTableA => (3, None, NextOp::Embedded),
+            GlobalPitchSlideHi => (3, None, NextOp::Embedded),
+            GlobalPitchSlideLo => (3, None, NextOp::Embedded),
+            SetGlobalPitchAbsHi => (3, None, NextOp::Embedded),
+            SetGlobalPitchAbsLo => (3, None, NextOp::Embedded),
+            NoteTriggerRepeat => (5, None, NextOp::Embedded),
+            SetStereoMask => (1, None, NextOp::Embedded),
+            ClearChannelMask => (1, None, NextOp::Embedded),
+            IndirectOpcodeLoad => (2, None, NextOp::Branch),
+            InjectCmdRingBuf => (2, None, NextOp::Embedded),
+            CvsdSamplePlayback => (2, None, NextOp::Embedded),
+            TimingAdvanceAlt => (2, Some(3), NextOp::Embedded),
+            ProgramChange => (3, None, NextOp::Embedded),
+            PushPitchTable4b => (4, None, NextOp::Embedded),
+            SetVolumeAbs => (2, None, NextOp::Embedded),
+            VolumeFadeRel => (2, None, NextOp::Embedded),
+            FmKeyOnComplex => (2, Some(3), NextOp::Embedded),
+            UpdateNoteRegister => (2, None, NextOp::Embedded),
+            NoteRegisterDelta => (2, None, NextOp::Embedded),
+            FreeVoiceEnd => (0, None, NextOp::Terminal),
+            SetBankSwitch => (2, None, NextOp::Embedded),
         }
     }
 }
@@ -329,7 +325,13 @@ pub struct SeqInstruction {
 
 impl fmt::Display for SeqInstruction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:04X}: [{:02X}] {:<24}", self.pos, self.raw_opcode, format!("{:?}", self.opcode))?;
+        write!(
+            f,
+            "{:04X}: [{:02X}] {:<24}",
+            self.pos,
+            self.raw_opcode,
+            format!("{:?}", self.opcode)
+        )?;
         if !self.operands.is_empty() {
             let hex: Vec<String> = self.operands.iter().map(|b| format!("{:02X}", b)).collect();
             write!(f, " {}", hex.join(" "))?;
@@ -472,7 +474,10 @@ fn decode_sequence(
                                 start_addr,
                                 instructions,
                                 complete: false,
-                                truncation: Some(format!("call target 0x{:04X} out of bounds", target_addr)),
+                                truncation: Some(format!(
+                                    "call target 0x{:04X} out of bounds",
+                                    target_addr
+                                )),
                             };
                         }
                         current_op_raw = u18[target_file];
@@ -646,11 +651,7 @@ pub struct VoiceDescriptor {
 }
 
 /// Parse a voice-type descriptor at the given 6809 address.
-fn parse_voice_descriptor(
-    u18: &[u8],
-    addr: u16,
-    header: &RomHeader,
-) -> Result<VoiceDescriptor> {
+fn parse_voice_descriptor(u18: &[u8], addr: u16, header: &RomHeader) -> Result<VoiceDescriptor> {
     let base = header.to_file_offset(addr);
     if base >= u18.len() {
         bail!("voice descriptor address 0x{:04X} out of bounds", addr);
@@ -714,10 +715,7 @@ pub struct CommandDispatchEntry {
 }
 
 /// Parse the command dispatch table from a U18 ROM.
-fn parse_cmd_dispatch_table(
-    u18: &[u8],
-    header: &RomHeader,
-) -> Result<Vec<CommandDispatchEntry>> {
+fn parse_cmd_dispatch_table(u18: &[u8], header: &RomHeader) -> Result<Vec<CommandDispatchEntry>> {
     let table_file = header.to_file_offset(header.cmd_dispatch_table);
     let count = (header.max_cmd_index as usize) + 1;
 
@@ -869,7 +867,11 @@ pub fn extract_programs(u18_data: &[u8]) -> Result<Vec<SoundProgram>> {
 
                 let mut sequences = Vec::new();
                 for &(ch, seq_addr) in &fm_channels {
-                    let label = if ch < 8 { format!("FM{}", ch) } else { format!("CH{}", ch) };
+                    let label = if ch < 8 {
+                        format!("FM{}", ch)
+                    } else {
+                        format!("CH{}", ch)
+                    };
                     sequences.push(decode_sequence(u18_data, seq_addr, &label, &header));
                 }
 
@@ -920,7 +922,11 @@ pub fn format_programs(programs: &[SoundProgram], header: &RomHeader) -> String 
         out.push_str(&format!(
             "    FM mask: 0x{:02X} (ch {})\n",
             desc.fm_mask,
-            if ch_list.is_empty() { "none".to_string() } else { ch_list.join(", ") },
+            if ch_list.is_empty() {
+                "none".to_string()
+            } else {
+                ch_list.join(", ")
+            },
         ));
 
         for &(ch, addr) in &desc.fm_channels {
@@ -940,10 +946,17 @@ pub fn format_programs(programs: &[SoundProgram], header: &RomHeader) -> String 
 
         for seq in &prog.sequences {
             out.push('\n');
-            let status = if seq.complete { "complete" } else { "INCOMPLETE" };
+            let status = if seq.complete {
+                "complete"
+            } else {
+                "INCOMPLETE"
+            };
             out.push_str(&format!(
                 "  [{}] @ 0x{:04X} ({}, {} instructions)\n",
-                seq.channel, seq.start_addr, status, seq.instructions.len(),
+                seq.channel,
+                seq.start_addr,
+                status,
+                seq.instructions.len(),
             ));
 
             for inst in &seq.instructions {
