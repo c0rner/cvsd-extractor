@@ -126,7 +126,7 @@ fn decode_bank_selector(bank_selector: u8) -> Option<(RomChip, u8)> {
 }
 
 /// Read a big-endian u16 from `data` at byte position `pos`.
-fn read_be_u16(data: &[u8], pos: usize) -> u16 {
+pub fn read_be_u16(data: &[u8], pos: usize) -> u16 {
     u16::from_be_bytes([data[pos], data[pos + 1]])
 }
 
@@ -184,9 +184,25 @@ impl RomHeader {
         })
     }
 
-    /// Convert a 6809 banked-ROM address (0x4000–0xBFFF) to a U18 file offset.
+    /// Convert a 6809 ROM address to a U18 file offset.
+    ///
+    /// Handles both the banked window (0x4000–0xBFFF, mapped to the system
+    /// bank page) and the fixed bank (0xC000–0xFFFF, always the last 16 KB
+    /// of the ROM image).
     pub fn to_file_offset(&self, addr: u16) -> usize {
-        (addr as usize) - 0x4000 + self.system_bank_file
+        if addr >= 0xC000 {
+            // Fixed bank: last 16 KB of ROM, always accessible.
+            let rom_len = self.system_bank_file + 0x20000;
+            rom_len - 0x4000 + (addr as usize - 0xC000)
+        } else {
+            // Banked window: 0x4000–0xBFFF mapped to system bank.
+            (addr as usize) - 0x4000 + self.system_bank_file
+        }
+    }
+
+    /// Total ROM size in bytes.
+    pub fn rom_len(&self) -> usize {
+        self.system_bank_file + 0x20000
     }
 }
 
@@ -203,25 +219,8 @@ pub fn parse_cvsd_table(roms: &RomSet) -> Result<Vec<CvsdEntry>> {
     let u18_data = std::fs::read(&roms.u18)
         .with_context(|| format!("failed to read u18 ROM: {}", roms.u18.display()))?;
 
-    let u18_size = u18_data.len();
-
-    // The system bank (0x7C = U18 page 0x1C) is always the default. Its file
-    // offset equals `u18_size - 0x20000`, which works for any ROM size because
-    // bank 0x1C sits exactly 0x20000 bytes from the end of the U18 image.
-    if u18_size < 0x20000 {
-        bail!(
-            "u18 ROM is too small ({} bytes); expected at least 0x20000",
-            u18_size
-        );
-    }
-    let system_bank_file = u18_size - 0x20000;
-
-    // Read the CVSD table pointer from the ROM header.
-    let table_ptr_file = system_bank_file + ROM_HDR_CVSD_SAMPLE_TABLE;
-    let cvsd_table_ptr_raw = read_be_u16(&u18_data, table_ptr_file) as usize;
-
-    // Convert from 6809 banked-ROM address (0x4000-based) to file offset.
-    let cvsd_table_file = cvsd_table_ptr_raw - 0x4000 + system_bank_file;
+    let hdr = RomHeader::from_u18(&u18_data)?;
+    let cvsd_table_file = hdr.to_file_offset(hdr.cvsd_sample_table);
 
     let mut entries = Vec::new();
     let mut counter = 0usize;
@@ -232,10 +231,12 @@ pub fn parse_cvsd_table(roms: &RomSet) -> Result<Vec<CvsdEntry>> {
         if entry_ptr_pos + 2 > u18_data.len() {
             break;
         }
-        let entry_ptr_raw = read_be_u16(&u18_data, entry_ptr_pos) as usize;
-        let entry_file = entry_ptr_raw
-            .wrapping_sub(0x4000)
-            .wrapping_add(system_bank_file);
+        let entry_ptr = read_be_u16(&u18_data, entry_ptr_pos);
+        if entry_ptr < 0x4000 {
+            // Values below the banked window are end-of-table sentinels.
+            break;
+        }
+        let entry_file = hdr.to_file_offset(entry_ptr);
 
         if entry_file + 5 > u18_data.len() {
             break;
@@ -257,7 +258,7 @@ pub fn parse_cvsd_table(roms: &RomSet) -> Result<Vec<CvsdEntry>> {
             RomChip::U15 => std::fs::metadata(&roms.u15)
                 .with_context(|| format!("cannot stat u15: {}", roms.u15.display()))?
                 .len() as usize,
-            RomChip::U18 => u18_size,
+            RomChip::U18 => hdr.rom_len(),
         };
 
         // Convert bank number + 6809 address to a raw file offset.
