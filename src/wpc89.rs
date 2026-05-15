@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -82,7 +84,7 @@ pub enum RomChip {
 pub struct CvsdEntry {
     /// Which ROM chip the audio data lives in.
     pub chip: RomChip,
-    /// ROM bank number (bits [4:0] of the bank selector byte).
+    /// ROM bank number (bits \[4:0\] of the bank selector byte).
     pub bank: u8,
     /// Byte offset of the CVSD data in the ROM file.
     pub offset: usize,

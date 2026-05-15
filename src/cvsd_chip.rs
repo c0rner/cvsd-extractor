@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Chip-logic simulation of the Harris HC55536 CVSD decoder.
 //
 // Implements `process_bit_HC555XX` from the PinMAME reference (hc55516.c),

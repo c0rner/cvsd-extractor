@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
 //! WPC-89 sound-program extraction and sequence bytecode decoder.
 //!
 //! The WPC-89 sound firmware uses a voice-sequencer architecture to play

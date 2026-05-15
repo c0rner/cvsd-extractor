@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -20,8 +22,8 @@ pub const SAMPLE_RATE_HZ: u32 = 22372;
 pub fn write_wav(path: impl AsRef<Path>, samples: &[i8], output_rate: u32) -> Result<()> {
     let resampled;
     let samples = if output_rate != SAMPLE_RATE_HZ {
-        resampled = resample(samples, SAMPLE_RATE_HZ, output_rate)
-            .context("failed to resample audio")?;
+        resampled =
+            resample(samples, SAMPLE_RATE_HZ, output_rate).context("failed to resample audio")?;
         &resampled[..]
     } else {
         samples
@@ -68,9 +70,8 @@ fn resample(samples: &[i8], from_rate: u32, to_rate: u32) -> Result<Vec<i8>> {
         window,
     };
 
-    let mut resampler =
-        Async::<f32>::new_sinc(ratio, 2.0, &params, 1024, 1, FixedAsync::Input)
-            .map_err(|e| anyhow::anyhow!("failed to create resampler: {e}"))?;
+    let mut resampler = Async::<f32>::new_sinc(ratio, 2.0, &params, 1024, 1, FixedAsync::Input)
+        .map_err(|e| anyhow::anyhow!("failed to create resampler: {e}"))?;
 
     let float_in: Vec<f32> = samples.iter().map(|&s| s as f32 / 128.0).collect();
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
 pub mod cvsd_chip;
 pub mod sound_program;
 pub mod wav;
