@@ -2,11 +2,26 @@ use argh::FromArgs;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use pinball_cvsd_patcher::{extract_all, wav::SAMPLE_RATE_HZ, RomSet};
+use cvsd_extractor::{RomSet, extract_all, sound_program, wav::SAMPLE_RATE_HZ};
 
-/// Extract CVSD audio samples from WPC89 pinball sound ROMs.
+/// WPC-89 pinball sound ROM tool — extract CVSD audio and decode sound programs.
 #[derive(FromArgs)]
 struct Args {
+    #[argh(subcommand)]
+    command: Command,
+}
+
+#[derive(FromArgs)]
+#[argh(subcommand)]
+enum Command {
+    Extract(ExtractArgs),
+    Programs(ProgramsArgs),
+}
+
+/// Extract CVSD audio samples as WAV files.
+#[derive(FromArgs)]
+#[argh(subcommand, name = "extract")]
+struct ExtractArgs {
     /// path to the U14 sound ROM
     #[argh(option)]
     u14: PathBuf,
@@ -29,6 +44,15 @@ struct Args {
     output_rate: u32,
 }
 
+/// Decode and display sound programs from a U18 ROM.
+#[derive(FromArgs)]
+#[argh(subcommand, name = "programs")]
+struct ProgramsArgs {
+    /// path to the U18 sound ROM
+    #[argh(option)]
+    u18: PathBuf,
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -38,9 +62,22 @@ fn main() -> Result<()> {
         .init();
 
     let args: Args = argh::from_env();
-    let roms = RomSet::new(&args.u14, &args.u15, &args.u18);
-    let count = extract_all(&roms, &args.output, args.output_rate)?;
-    println!("Extracted {} audio samples to '{}'", count, args.output.display());
+
+    match args.command {
+        Command::Extract(ea) => {
+            let roms = RomSet::new(&ea.u14, &ea.u15, &ea.u18);
+            let count = extract_all(&roms, &ea.output, ea.output_rate)?;
+            println!(
+                "Extracted {} audio samples to '{}'",
+                count,
+                ea.output.display()
+            );
+        }
+        Command::Programs(pa) => {
+            let report = sound_program::summarise_programs(&pa.u18)?;
+            print!("{}", report);
+        }
+    }
+
     Ok(())
 }
-
