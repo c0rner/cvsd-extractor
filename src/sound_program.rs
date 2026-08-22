@@ -28,9 +28,62 @@
 
 use std::fmt;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Context;
+use thiserror::Error;
 
-use crate::wpc89::{self, RomHeader};
+use crate::wpc89::{self, RomError, RomHeader};
+
+/// Fatal errors while parsing declared sound-program tables and records.
+#[derive(Debug, Error)]
+pub enum ProgramError {
+    #[error(transparent)]
+    Rom(#[from] RomError),
+    #[error("{table} pointer {addr:#06x} is invalid: {source}")]
+    InvalidTablePointer {
+        table: &'static str,
+        addr: u16,
+        #[source]
+        source: RomError,
+    },
+    #[error(
+        "dispatch table is truncated: declared {expected} entries, only {available} bytes remain"
+    )]
+    TruncatedDispatch { expected: usize, available: usize },
+    #[error("voice-type table entry {index} is truncated")]
+    TruncatedVoiceTypeEntry { index: usize },
+    #[error("command {command:#04x} references invalid voice descriptor {addr:#06x}: {source}")]
+    InvalidVoiceDescriptor {
+        command: u8,
+        addr: u16,
+        #[source]
+        source: Box<ProgramError>,
+    },
+    #[error("voice descriptor at {addr:#06x} is truncated while reading {field}")]
+    TruncatedVoiceDescriptor { addr: u16, field: String },
+    #[error("sound-program table entry {index} is truncated")]
+    TruncatedProgramEntry { index: usize },
+    #[error("command {command:#04x} references invalid sound program address {addr:#06x}")]
+    InvalidProgramAddress { command: u8, addr: u16 },
+    #[error("sound program at {addr:#06x} is truncated")]
+    TruncatedProgram { addr: u16 },
+}
+
+/// Nonfatal facts encountered while extracting otherwise valid programs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgramDiagnostic {
+    UnsupportedHandler {
+        command: u8,
+        handler_id: u8,
+        param: u8,
+    },
+}
+
+/// Programs plus explicit diagnostics for commands that cannot be decoded.
+#[derive(Debug, Clone)]
+pub struct ProgramExtraction {
+    pub programs: Vec<SoundProgram>,
+    pub diagnostics: Vec<ProgramDiagnostic>,
+}
 
 // ---------------------------------------------------------------------------
 // Sequencer opcodes
@@ -374,8 +427,21 @@ fn decode_sequence(
     let mut instructions = Vec::new();
     let mut call_stack: Vec<usize> = Vec::new();
 
-    let start_file = header.to_file_offset(start_addr);
-    if start_file >= u18.len() {
+    let start_file = match header.to_file_offset(start_addr) {
+        Ok(offset) => offset,
+        Err(error) => {
+            return DecodedSequence {
+                channel: channel.to_string(),
+                start_addr,
+                instructions,
+                complete: false,
+                truncation: Some(error.to_string()),
+            };
+        }
+    };
+
+    // The first byte of the sequence is the initial opcode.
+    let Some(mut current_op_raw) = u18.get(start_file).copied() else {
         return DecodedSequence {
             channel: channel.to_string(),
             start_addr,
@@ -383,11 +449,8 @@ fn decode_sequence(
             complete: false,
             truncation: Some("start address out of bounds".into()),
         };
-    }
-
-    // The first byte of the sequence is the initial opcode.
-    let mut current_op_raw = u18[start_file];
-    let mut data_pos = start_file + 1; // data pointer (past initial opcode)
+    };
+    let mut data_pos = start_file.saturating_add(1); // data pointer (past initial opcode)
     let mut stream_offset: usize = 0; // byte offset within the stream for display
 
     for _ in 0..MAX_INSTRUCTIONS {
@@ -409,7 +472,15 @@ fn decode_sequence(
         match next_behavior {
             NextOp::Terminal => {
                 let byte_count = primary;
-                if data_pos + byte_count > u18.len() {
+                let Some(end) = data_pos.checked_add(byte_count) else {
+                    return incomplete_sequence(
+                        channel,
+                        start_addr,
+                        instructions,
+                        "terminal range overflow",
+                    );
+                };
+                let Some(bytes) = u18.get(data_pos..end) else {
                     return DecodedSequence {
                         channel: channel.to_string(),
                         start_addr,
@@ -417,8 +488,8 @@ fn decode_sequence(
                         complete: false,
                         truncation: Some("truncated at terminal".into()),
                     };
-                }
-                let operands = u18[data_pos..data_pos + byte_count].to_vec();
+                };
+                let operands = bytes.to_vec();
                 instructions.push(SeqInstruction {
                     pos: stream_offset,
                     raw_opcode: current_op_raw,
@@ -437,7 +508,10 @@ fn decode_sequence(
             NextOp::Branch => {
                 match opcode {
                     SeqOpcode::SubroutineCall => {
-                        if data_pos + 2 > u18.len() {
+                        let Some(operand_bytes) = data_pos
+                            .checked_add(2)
+                            .and_then(|end| u18.get(data_pos..end))
+                        else {
                             return DecodedSequence {
                                 channel: channel.to_string(),
                                 start_addr,
@@ -445,17 +519,27 @@ fn decode_sequence(
                                 complete: false,
                                 truncation: Some("truncated at call".into()),
                             };
-                        }
-                        let target_addr = wpc89::read_be_u16(u18, data_pos);
+                        };
+                        let target_addr = match wpc89::read_be_u16(u18, data_pos) {
+                            Ok(addr) => addr,
+                            Err(error) => {
+                                return incomplete_sequence(
+                                    channel,
+                                    start_addr,
+                                    instructions,
+                                    &error.to_string(),
+                                );
+                            }
+                        };
                         instructions.push(SeqInstruction {
                             pos: stream_offset,
                             raw_opcode: current_op_raw,
                             opcode,
-                            operands: vec![u18[data_pos], u18[data_pos + 1]],
+                            operands: operand_bytes.to_vec(),
                         });
 
                         // Push return address (byte after the 2-byte target operand).
-                        let return_pos = data_pos + 2;
+                        let return_pos = data_pos.saturating_add(2);
                         if call_stack.len() >= MAX_CALL_DEPTH {
                             return DecodedSequence {
                                 channel: channel.to_string(),
@@ -469,8 +553,18 @@ fn decode_sequence(
                         stream_offset += 3; // opcode position + 2 operand bytes consumed
 
                         // Jump to target.
-                        let target_file = header.to_file_offset(target_addr);
-                        if target_file >= u18.len() {
+                        let target_file = match header.to_file_offset(target_addr) {
+                            Ok(offset) => offset,
+                            Err(error) => {
+                                return incomplete_sequence(
+                                    channel,
+                                    start_addr,
+                                    instructions,
+                                    &format!("call target: {error}"),
+                                );
+                            }
+                        };
+                        let Some(target_opcode) = u18.get(target_file).copied() else {
                             return DecodedSequence {
                                 channel: channel.to_string(),
                                 start_addr,
@@ -481,9 +575,9 @@ fn decode_sequence(
                                     target_addr
                                 )),
                             };
-                        }
-                        current_op_raw = u18[target_file];
-                        data_pos = target_file + 1;
+                        };
+                        current_op_raw = target_opcode;
+                        data_pos = target_file.saturating_add(1);
                     }
                     SeqOpcode::SubroutineReturn => {
                         instructions.push(SeqInstruction {
@@ -494,7 +588,7 @@ fn decode_sequence(
                         });
 
                         if let Some(ret_pos) = call_stack.pop() {
-                            if ret_pos >= u18.len() {
+                            let Some(return_opcode) = u18.get(ret_pos).copied() else {
                                 return DecodedSequence {
                                     channel: channel.to_string(),
                                     start_addr,
@@ -502,10 +596,10 @@ fn decode_sequence(
                                     complete: false,
                                     truncation: Some("return address out of bounds".into()),
                                 };
-                            }
+                            };
                             // The byte at ret_pos is the next opcode.
-                            current_op_raw = u18[ret_pos];
-                            data_pos = ret_pos + 1;
+                            current_op_raw = return_opcode;
+                            data_pos = ret_pos.saturating_add(1);
                             stream_offset += 1;
                         } else {
                             // Empty call stack — treat as terminal.
@@ -521,8 +615,8 @@ fn decode_sequence(
                     _ => {
                         // IndirectOpcodeLoad or other branch — stop decoding.
                         let byte_count = primary;
-                        let end = (data_pos + byte_count).min(u18.len());
-                        let operands = u18[data_pos..end].to_vec();
+                        let end = data_pos.saturating_add(byte_count).min(u18.len());
+                        let operands = u18.get(data_pos..end).unwrap_or_default().to_vec();
                         instructions.push(SeqInstruction {
                             pos: stream_offset,
                             raw_opcode: current_op_raw,
@@ -544,7 +638,15 @@ fn decode_sequence(
                 // Determine byte count — try primary, then alternate if available.
                 let byte_count = resolve_variable_size(u18, data_pos, primary, alternate);
 
-                if data_pos + byte_count > u18.len() || byte_count == 0 {
+                let Some(end) = data_pos.checked_add(byte_count) else {
+                    return incomplete_sequence(
+                        channel,
+                        start_addr,
+                        instructions,
+                        "operand range overflow",
+                    );
+                };
+                let Some(all_bytes) = u18.get(data_pos..end) else {
                     return DecodedSequence {
                         channel: channel.to_string(),
                         start_addr,
@@ -552,9 +654,15 @@ fn decode_sequence(
                         complete: false,
                         truncation: Some("truncated".into()),
                     };
+                };
+                if byte_count == 0 {
+                    return incomplete_sequence(
+                        channel,
+                        start_addr,
+                        instructions,
+                        "zero-length operand rule",
+                    );
                 }
-
-                let all_bytes = &u18[data_pos..data_pos + byte_count];
                 // Data operands are all bytes except the last (which is the next opcode).
                 let operands = all_bytes[..byte_count - 1].to_vec();
                 let next_op_raw = all_bytes[byte_count - 1];
@@ -566,8 +674,8 @@ fn decode_sequence(
                     operands,
                 });
 
-                data_pos += byte_count;
-                stream_offset += byte_count; // advance stream offset past operands + next_op
+                data_pos = end;
+                stream_offset = stream_offset.saturating_add(byte_count); // advance stream offset past operands + next_op
                 current_op_raw = next_op_raw;
             }
         }
@@ -579,6 +687,21 @@ fn decode_sequence(
         instructions,
         complete: false,
         truncation: Some("max instructions reached".into()),
+    }
+}
+
+fn incomplete_sequence(
+    channel: &str,
+    start_addr: u16,
+    instructions: Vec<SeqInstruction>,
+    reason: &str,
+) -> DecodedSequence {
+    DecodedSequence {
+        channel: channel.to_string(),
+        start_addr,
+        instructions,
+        complete: false,
+        truncation: Some(reason.to_string()),
     }
 }
 
@@ -597,19 +720,28 @@ fn resolve_variable_size(
 
     let sizes = [primary, alt];
     for &size in &sizes {
-        if size == 0 || pos + size > data.len() {
+        let Some(end) = pos.checked_add(size) else {
+            continue;
+        };
+        if size == 0 || end > data.len() {
             continue;
         }
-        let candidate_next = data[pos + size - 1];
+        let Some(candidate_next) = data.get(end - 1).copied() else {
+            continue;
+        };
         if let Some(next_op) = SeqOpcode::from_u8(candidate_next) {
             // Lookahead: check that the instruction AFTER this one also makes sense.
             let (next_primary, _, next_behavior) = next_op.operand_info();
             match next_behavior {
                 NextOp::Terminal | NextOp::Branch => return size,
                 NextOp::Embedded => {
-                    let next_end = pos + size + next_primary;
+                    let Some(next_end) = end.checked_add(next_primary) else {
+                        continue;
+                    };
                     if next_end <= data.len() && next_primary > 0 {
-                        let next_next = data[next_end - 1];
+                        let Some(next_next) = data.get(next_end - 1).copied() else {
+                            continue;
+                        };
                         if SeqOpcode::from_u8(next_next).is_some() {
                             return size;
                         }
@@ -653,38 +785,55 @@ pub struct VoiceDescriptor {
 }
 
 /// Parse a voice-type descriptor at the given 6809 address.
-fn parse_voice_descriptor(u18: &[u8], addr: u16, header: &RomHeader) -> Result<VoiceDescriptor> {
-    let base = header.to_file_offset(addr);
-    if base >= u18.len() {
-        bail!("voice descriptor address 0x{:04X} out of bounds", addr);
-    }
-
-    let fm_mask = u18[base];
-    let mut offset = base + 1;
+fn parse_voice_descriptor(
+    u18: &[u8],
+    addr: u16,
+    header: &RomHeader,
+) -> std::result::Result<VoiceDescriptor, ProgramError> {
+    let base = header.to_file_offset(addr)?;
+    let fm_mask = u18
+        .get(base)
+        .copied()
+        .ok_or_else(|| ProgramError::TruncatedVoiceDescriptor {
+            addr,
+            field: "FM mask".into(),
+        })?;
+    let mut offset = base.checked_add(1).ok_or(RomError::ArithmeticOverflow {
+        context: "voice descriptor offset",
+    })?;
 
     let mut fm_channels = Vec::new();
     for ch in 0..8u8 {
         if fm_mask & (1 << ch) != 0 {
-            if offset + 2 > u18.len() {
-                bail!("voice descriptor truncated reading FM ch{} pointer", ch);
-            }
-            let seq_addr = wpc89::read_be_u16(u18, offset);
+            let seq_addr = wpc89::read_be_u16(u18, offset).map_err(|_| {
+                ProgramError::TruncatedVoiceDescriptor {
+                    addr,
+                    field: format!("FM channel {ch} pointer"),
+                }
+            })?;
             fm_channels.push((ch, seq_addr));
-            offset += 2;
+            offset = offset.checked_add(2).ok_or(RomError::ArithmeticOverflow {
+                context: "voice descriptor channel offset",
+            })?;
         }
     }
 
-    if offset >= u18.len() {
-        bail!("voice descriptor truncated reading CVSD type");
-    }
-    let cvsd_type = u18[offset];
-    offset += 1;
+    let cvsd_type =
+        u18.get(offset)
+            .copied()
+            .ok_or_else(|| ProgramError::TruncatedVoiceDescriptor {
+                addr,
+                field: "CVSD type".into(),
+            })?;
+    offset = offset.saturating_add(1);
 
     let cvsd_seq_addr = if cvsd_type != 0 {
-        if offset + 2 > u18.len() {
-            bail!("voice descriptor truncated reading CVSD sequence pointer");
-        }
-        Some(wpc89::read_be_u16(u18, offset))
+        Some(wpc89::read_be_u16(u18, offset).map_err(|_| {
+            ProgramError::TruncatedVoiceDescriptor {
+                addr,
+                field: "CVSD sequence pointer".into(),
+            }
+        })?)
     } else {
         None
     };
@@ -717,19 +866,39 @@ pub struct CommandDispatchEntry {
 }
 
 /// Parse the command dispatch table from a U18 ROM.
-fn parse_cmd_dispatch_table(u18: &[u8], header: &RomHeader) -> Result<Vec<CommandDispatchEntry>> {
-    let table_file = header.to_file_offset(header.cmd_dispatch_table);
+fn parse_cmd_dispatch_table(
+    u18: &[u8],
+    header: &RomHeader,
+) -> std::result::Result<Vec<CommandDispatchEntry>, ProgramError> {
+    let table_file = header
+        .to_file_offset(header.cmd_dispatch_table)
+        .map_err(|source| ProgramError::InvalidTablePointer {
+            table: "command dispatch table",
+            addr: header.cmd_dispatch_table,
+            source,
+        })?;
     let count = (header.max_cmd_index as usize) + 1;
+    let byte_count = count.checked_mul(2).ok_or(RomError::ArithmeticOverflow {
+        context: "dispatch table size",
+    })?;
+    let available = u18.len().saturating_sub(table_file);
+    let end = table_file
+        .checked_add(byte_count)
+        .ok_or(RomError::ArithmeticOverflow {
+            context: "dispatch table range",
+        })?;
+    let bytes = u18
+        .get(table_file..end)
+        .ok_or(ProgramError::TruncatedDispatch {
+            expected: count,
+            available,
+        })?;
 
     let mut entries = Vec::with_capacity(count);
-    for i in 0..count {
-        let offset = table_file + i * 2;
-        if offset + 2 > u18.len() {
-            break;
-        }
+    for pair in bytes.chunks_exact(2) {
         entries.push(CommandDispatchEntry {
-            handler_id: u18[offset],
-            param: u18[offset + 1],
+            handler_id: pair[0],
+            param: pair[1],
         });
     }
     Ok(entries)
@@ -764,12 +933,18 @@ pub struct SoundProgram {
 ///   descriptors with FM_mask + per-channel sequence pointers.
 /// - **0x01** (`start_sound_program`): Uses the sound-program table → 10-entry
 ///   channel pointer arrays read from offset +0x12 backward.
-pub fn extract_programs(u18_data: &[u8]) -> Result<Vec<SoundProgram>> {
+pub fn extract_programs(u18_data: &[u8]) -> std::result::Result<ProgramExtraction, ProgramError> {
     let header = RomHeader::from_u18(u18_data)?;
     let dispatch = parse_cmd_dispatch_table(u18_data, &header)?;
 
     // Parse the voice-type table: a table of 2-byte pointers to descriptors.
-    let vt_table_file = header.to_file_offset(header.voice_type_table);
+    let vt_table_file = header
+        .to_file_offset(header.voice_type_table)
+        .map_err(|source| ProgramError::InvalidTablePointer {
+            table: "voice-type table",
+            addr: header.voice_type_table,
+            source,
+        })?;
 
     // Find the maximum voice type index used by handler 0x04.
     let max_vt_idx = dispatch
@@ -780,34 +955,46 @@ pub fn extract_programs(u18_data: &[u8]) -> Result<Vec<SoundProgram>> {
         .unwrap_or(0);
 
     // Read voice-type table pointers.
-    let mut vt_pointers: Vec<Option<u16>> = Vec::with_capacity(max_vt_idx + 1);
+    let mut vt_pointers: Vec<u16> = Vec::with_capacity(max_vt_idx + 1);
     for i in 0..=max_vt_idx {
-        let ptr_offset = vt_table_file + i * 2;
-        if ptr_offset + 2 <= u18_data.len() {
-            vt_pointers.push(Some(wpc89::read_be_u16(u18_data, ptr_offset)));
-        } else {
-            vt_pointers.push(None);
-        }
+        let ptr_offset = i
+            .checked_mul(2)
+            .and_then(|n| vt_table_file.checked_add(n))
+            .ok_or(RomError::ArithmeticOverflow {
+                context: "voice-type table offset",
+            })?;
+        vt_pointers.push(
+            wpc89::read_be_u16(u18_data, ptr_offset)
+                .map_err(|_| ProgramError::TruncatedVoiceTypeEntry { index: i })?,
+        );
     }
 
     // Sound program table for handler 0x01.
-    let spt_table_file = header.to_file_offset(header.sound_program_table);
+    let spt_table_file = header
+        .to_file_offset(header.sound_program_table)
+        .map_err(|source| ProgramError::InvalidTablePointer {
+            table: "sound-program table",
+            addr: header.sound_program_table,
+            source,
+        })?;
 
     let mut programs = Vec::new();
+    let mut diagnostics = Vec::new();
 
     for (cmd_idx, entry) in dispatch.iter().enumerate() {
         match entry.handler_id {
             0x04 => {
                 // Voice-type table dispatch.
                 let vt_idx = entry.param as usize;
-                let desc_addr = match vt_pointers.get(vt_idx).copied().flatten() {
-                    Some(addr) => addr,
-                    None => continue,
-                };
-                let descriptor = match parse_voice_descriptor(u18_data, desc_addr, &header) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
+                let desc_addr = vt_pointers[vt_idx];
+                let descriptor =
+                    parse_voice_descriptor(u18_data, desc_addr, &header).map_err(|source| {
+                        ProgramError::InvalidVoiceDescriptor {
+                            command: cmd_idx as u8,
+                            addr: desc_addr,
+                            source: Box::new(source),
+                        }
+                    })?;
 
                 let mut sequences = Vec::new();
                 for &(ch, seq_addr) in &descriptor.fm_channels {
@@ -833,24 +1020,41 @@ pub fn extract_programs(u18_data: &[u8]) -> Result<Vec<SoundProgram>> {
                 // pointers (channels 0–9). The firmware reads from offset +0x12
                 // backward, assigning channels 9 down to 0.
                 let param = entry.param as usize;
-                let ptr_offset = spt_table_file + param * 2;
-                if ptr_offset + 2 > u18_data.len() {
-                    continue;
-                }
-                let prog_addr = wpc89::read_be_u16(u18_data, ptr_offset);
+                let ptr_offset = param
+                    .checked_mul(2)
+                    .and_then(|n| spt_table_file.checked_add(n))
+                    .ok_or(RomError::ArithmeticOverflow {
+                        context: "sound-program table offset",
+                    })?;
+                let prog_addr = wpc89::read_be_u16(u18_data, ptr_offset)
+                    .map_err(|_| ProgramError::TruncatedProgramEntry { index: param })?;
                 if prog_addr < 0x4000 {
-                    continue;
+                    return Err(ProgramError::InvalidProgramAddress {
+                        command: cmd_idx as u8,
+                        addr: prog_addr,
+                    });
                 }
-                let prog_file = header.to_file_offset(prog_addr);
-                if prog_file + 20 > u18_data.len() {
-                    continue;
-                }
+                let prog_file = header.to_file_offset(prog_addr).map_err(|_| {
+                    ProgramError::InvalidProgramAddress {
+                        command: cmd_idx as u8,
+                        addr: prog_addr,
+                    }
+                })?;
+                let prog_end = prog_file
+                    .checked_add(20)
+                    .ok_or(RomError::ArithmeticOverflow {
+                        context: "sound-program record range",
+                    })?;
+                let record = u18_data
+                    .get(prog_file..prog_end)
+                    .ok_or(ProgramError::TruncatedProgram { addr: prog_addr })?;
 
                 // Build a synthetic VoiceDescriptor from the program record.
                 let mut fm_channels = Vec::new();
                 let mut fm_mask: u8 = 0;
                 for ch in 0u8..10 {
-                    let seq_addr = wpc89::read_be_u16(u18_data, prog_file + (ch as usize) * 2);
+                    let seq_pos = usize::from(ch) * 2;
+                    let seq_addr = u16::from_be_bytes([record[seq_pos], record[seq_pos + 1]]);
                     if seq_addr >= 0x4000 {
                         if ch < 8 {
                             fm_mask |= 1 << ch;
@@ -886,11 +1090,18 @@ pub fn extract_programs(u18_data: &[u8]) -> Result<Vec<SoundProgram>> {
                 });
             }
 
-            _ => {}
+            _ => diagnostics.push(ProgramDiagnostic::UnsupportedHandler {
+                command: cmd_idx as u8,
+                handler_id: entry.handler_id,
+                param: entry.param,
+            }),
         }
     }
 
-    Ok(programs)
+    Ok(ProgramExtraction {
+        programs,
+        diagnostics,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -898,17 +1109,17 @@ pub fn extract_programs(u18_data: &[u8]) -> Result<Vec<SoundProgram>> {
 // ---------------------------------------------------------------------------
 
 /// Format all programs into a human-readable report string.
-pub fn format_programs(programs: &[SoundProgram], header: &RomHeader) -> String {
+pub fn format_programs(extraction: &ProgramExtraction, header: &RomHeader) -> String {
     let mut out = String::new();
 
     out.push_str("=== WPC-89 Sound Program Report ===\n");
     out.push_str(&format!(
         "Max command index: 0x{:02X}, Programs decoded: {}\n\n",
         header.max_cmd_index,
-        programs.len(),
+        extraction.programs.len(),
     ));
 
-    for prog in programs {
+    for prog in &extraction.programs {
         out.push_str(&format!(
             "--- Command 0x{:02X} (handler=0x{:02X}, voice_type=0x{:02X}) ---\n",
             prog.command, prog.handler_id, prog.voice_type_index,
@@ -973,21 +1184,144 @@ pub fn format_programs(programs: &[SoundProgram], header: &RomHeader) -> String 
         out.push('\n');
     }
 
+    if !extraction.diagnostics.is_empty() {
+        out.push_str("=== Diagnostics ===\n");
+        for diagnostic in &extraction.diagnostics {
+            match diagnostic {
+                ProgramDiagnostic::UnsupportedHandler {
+                    command,
+                    handler_id,
+                    param,
+                } => out.push_str(&format!(
+                    "Unsupported handler: command=0x{command:02X}, handler=0x{handler_id:02X}, param=0x{param:02X}\n"
+                )),
+            }
+        }
+    }
+
     out
 }
 
 /// Produce a brief summary of sound programs found in a ROM.
-pub fn summarise_programs(u18_path: &std::path::Path) -> Result<String> {
+pub fn summarise_programs(u18_path: &std::path::Path) -> anyhow::Result<String> {
     let u18_data = std::fs::read(u18_path)
         .with_context(|| format!("failed to read U18 ROM: {}", u18_path.display()))?;
     let header = RomHeader::from_u18(&u18_data)?;
-    let programs = extract_programs(&u18_data)?;
+    let extraction = extract_programs(&u18_data)?;
 
     let mut out = String::new();
     out.push_str(&format!(
         "ROM: {}\n",
         u18_path.file_name().unwrap_or_default().to_string_lossy(),
     ));
-    out.push_str(&format_programs(&programs, &header));
+    out.push_str(&format_programs(&extraction, &header));
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wpc89::{
+        ROM_HDR_CMD_DISPATCH_TABLE, ROM_HDR_CVSD_SAMPLE_TABLE, ROM_HDR_DAC_SAMPLE_TABLE,
+        ROM_HDR_FM_PATCH_TABLE, ROM_HDR_FM_PROGRAM_TABLE, ROM_HDR_MAX_CMD_INDEX,
+        ROM_HDR_SOUND_PROGRAM_TABLE, ROM_HDR_VOICE_TYPE_TABLE,
+    };
+
+    fn set_word(data: &mut [u8], pos: usize, value: u16) {
+        data[pos..pos + 2].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn fixture(dispatch_addr: u16) -> Vec<u8> {
+        let mut rom = vec![0; 0x20000];
+        for (offset, address) in [
+            (ROM_HDR_FM_PATCH_TABLE, 0x4400),
+            (ROM_HDR_DAC_SAMPLE_TABLE, 0x4400),
+            (ROM_HDR_FM_PROGRAM_TABLE, 0x4400),
+            (ROM_HDR_VOICE_TYPE_TABLE, 0x4100),
+            (ROM_HDR_CMD_DISPATCH_TABLE, dispatch_addr),
+            (ROM_HDR_SOUND_PROGRAM_TABLE, 0x4300),
+            (ROM_HDR_CVSD_SAMPLE_TABLE, 0x4400),
+        ] {
+            set_word(&mut rom, offset, address);
+        }
+        rom
+    }
+
+    #[test]
+    fn zero_filled_128k_rom_returns_error_without_panicking() {
+        let rom = vec![0; 0x20000];
+        assert!(extract_programs(&rom).is_err());
+    }
+
+    #[test]
+    fn truncated_declared_dispatch_table_is_fatal() {
+        let mut rom = fixture(0xFFFF);
+        rom[ROM_HDR_MAX_CMD_INDEX] = 1;
+        let error = extract_programs(&rom).unwrap_err();
+        assert!(matches!(error, ProgramError::TruncatedDispatch { .. }));
+    }
+
+    #[test]
+    fn unsupported_handler_is_a_structured_diagnostic() {
+        let mut rom = fixture(0x4200);
+        rom[0x200..0x202].copy_from_slice(&[0x77, 0x55]);
+
+        let extraction = extract_programs(&rom).unwrap();
+        assert!(extraction.programs.is_empty());
+        assert_eq!(
+            extraction.diagnostics,
+            vec![ProgramDiagnostic::UnsupportedHandler {
+                command: 0,
+                handler_id: 0x77,
+                param: 0x55,
+            }]
+        );
+    }
+
+    #[test]
+    fn referenced_voice_descriptor_pointer_is_never_a_sentinel() {
+        let mut rom = fixture(0x4200);
+        rom[0x200..0x202].copy_from_slice(&[0x04, 0x00]);
+        set_word(&mut rom, 0x100, 0x0001);
+
+        let error = extract_programs(&rom).unwrap_err();
+        assert!(matches!(error, ProgramError::InvalidVoiceDescriptor { .. }));
+    }
+
+    #[test]
+    fn truncated_referenced_voice_descriptor_is_fatal() {
+        let mut rom = fixture(0x4200);
+        rom[0x200..0x202].copy_from_slice(&[0x04, 0x00]);
+        set_word(&mut rom, 0x100, 0xFFFF);
+        rom[0x1FFFF] = 0x01;
+
+        let error = extract_programs(&rom).unwrap_err();
+        assert!(matches!(
+            error,
+            ProgramError::InvalidVoiceDescriptor { source, .. }
+                if matches!(*source, ProgramError::TruncatedVoiceDescriptor { .. })
+        ));
+    }
+
+    #[test]
+    fn referenced_sound_program_pointer_is_never_a_sentinel() {
+        let mut rom = fixture(0x4200);
+        rom[0x200..0x202].copy_from_slice(&[0x01, 0x00]);
+        set_word(&mut rom, 0x300, 0x0000);
+
+        let error = extract_programs(&rom).unwrap_err();
+        assert!(matches!(error, ProgramError::InvalidProgramAddress { .. }));
+    }
+
+    #[test]
+    fn subwindow_channel_pointers_are_unused_slots() {
+        let mut rom = fixture(0x4200);
+        rom[0x200..0x202].copy_from_slice(&[0x01, 0x00]);
+        set_word(&mut rom, 0x300, 0x4500);
+        // The zero-filled 20-byte record contains ten legitimate unused slots.
+
+        let extraction = extract_programs(&rom).unwrap();
+        assert_eq!(extraction.programs.len(), 1);
+        assert!(extraction.programs[0].sequences.is_empty());
+    }
 }
