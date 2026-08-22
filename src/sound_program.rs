@@ -895,11 +895,10 @@ fn parse_cmd_dispatch_table(
         })?;
 
     let mut entries = Vec::with_capacity(count);
-    for pair in bytes.chunks_exact(2) {
-        entries.push(CommandDispatchEntry {
-            handler_id: pair[0],
-            param: pair[1],
-        });
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for &[handler_id, param] in pairs {
+        entries.push(CommandDispatchEntry { handler_id, param });
     }
     Ok(entries)
 }
