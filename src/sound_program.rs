@@ -26,6 +26,7 @@
 //! All structures and opcodes are derived from the decompiled firmware
 //! `reference/BL_U18.L1.c`.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use anyhow::Context;
@@ -296,68 +297,74 @@ enum NextOp {
     Branch,
 }
 
+/// How many data bytes an opcode consumes before its embedded next opcode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperandRule {
+    Fixed(usize),
+    /// A key-code byte followed by one timing byte when bit 7 is set, or two
+    /// timing bytes when it is clear.
+    KeyCodeTiming,
+    /// Reserved for future state-dependent encodings that cannot be resolved
+    /// from the bytes available to this decoder.
+    #[allow(dead_code)]
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpcodeInfo {
+    operands: OperandRule,
+    next: NextOp,
+}
+
 impl SeqOpcode {
-    /// Total bytes consumed from the data stream and next-opcode behavior.
-    ///
-    /// For [`NextOp::Embedded`], the last consumed byte is the next opcode.
-    /// For variable-length opcodes, returns `(primary, Some(alternate))`.
-    fn operand_info(self) -> (usize, Option<usize>, NextOp) {
+    /// Operand-length metadata and next-opcode behavior.
+    fn operand_info(self) -> OpcodeInfo {
         use SeqOpcode::*;
-        match self {
-            EndOfSequence => (1, None, NextOp::Terminal),
-            Nop => (0, None, NextOp::Terminal),
-            CvsdSampleStartStereo => (4, None, NextOp::Embedded),
-            CvsdSampleStart => (3, None, NextOp::Embedded),
-            TimingAdvance => (3, Some(4), NextOp::Embedded),
-            NoteOnTiming => (2, Some(3), NextOp::Embedded),
-            FmPatchLoad => (2, None, NextOp::Embedded),
-            PushPitchTable | PushPitchTableAlt => (2, None, NextOp::Embedded),
-            RepeatLoop | RepeatLoopAlt => (1, None, NextOp::Embedded),
-            SetAbsolutePitch => (2, None, NextOp::Embedded),
-            TriggerSubSound => (2, None, NextOp::Embedded),
-            GapNop11 | GapNop16 | GapNop20 => (0, None, NextOp::Terminal),
-            InjectCmdRerun => (1, None, NextOp::Terminal),
-            SubroutineCall => (2, None, NextOp::Branch),
-            SubroutineReturn => (0, None, NextOp::Branch),
-            FmKeyOff => (0, None, NextOp::Terminal),
-            CvsdFmNoteOnAbs => (3, None, NextOp::Embedded),
-            CvsdVoiceUpdate => (3, None, NextOp::Embedded),
-            CvsdFmNoteOnDelta => (3, None, NextOp::Embedded),
-            CvsdVibrato => (5, None, NextOp::Embedded),
-            Detune => (3, None, NextOp::Embedded),
-            NoteTimingCombined => (2, Some(3), NextOp::Embedded),
-            PitchGlide => (11, None, NextOp::Embedded),
-            StopDacCvsd => (0, None, NextOp::Terminal),
-            CvsdVolumeFade => (2, None, NextOp::Embedded),
-            SendStatusToCpu => (2, None, NextOp::Embedded),
-            SetChannelTiming => (3, None, NextOp::Embedded),
-            FmKeyOnWithTiming => (1, None, NextOp::Embedded),
-            AddTimingDelta => (3, None, NextOp::Embedded),
-            FmPitchDeltaTableB => (3, None, NextOp::Embedded),
-            FmPitchDeltaTableA => (3, None, NextOp::Embedded),
-            FmPitchAbsTableB => (3, None, NextOp::Embedded),
-            FmPitchAbsTableA => (3, None, NextOp::Embedded),
-            GlobalPitchSlideHi => (3, None, NextOp::Embedded),
-            GlobalPitchSlideLo => (3, None, NextOp::Embedded),
-            SetGlobalPitchAbsHi => (3, None, NextOp::Embedded),
-            SetGlobalPitchAbsLo => (3, None, NextOp::Embedded),
-            NoteTriggerRepeat => (5, None, NextOp::Embedded),
-            SetStereoMask => (1, None, NextOp::Embedded),
-            ClearChannelMask => (1, None, NextOp::Embedded),
-            IndirectOpcodeLoad => (2, None, NextOp::Branch),
-            InjectCmdRingBuf => (2, None, NextOp::Embedded),
-            CvsdSamplePlayback => (2, None, NextOp::Embedded),
-            TimingAdvanceAlt => (2, Some(3), NextOp::Embedded),
-            ProgramChange => (3, None, NextOp::Embedded),
-            PushPitchTable4b => (4, None, NextOp::Embedded),
-            SetVolumeAbs => (2, None, NextOp::Embedded),
-            VolumeFadeRel => (2, None, NextOp::Embedded),
-            FmKeyOnComplex => (2, Some(3), NextOp::Embedded),
-            UpdateNoteRegister => (2, None, NextOp::Embedded),
-            NoteRegisterDelta => (2, None, NextOp::Embedded),
-            FreeVoiceEnd => (0, None, NextOp::Terminal),
-            SetBankSwitch => (2, None, NextOp::Embedded),
-        }
+        let (operands, next) = match self {
+            EndOfSequence => (OperandRule::Fixed(1), NextOp::Terminal),
+            Nop => (OperandRule::Fixed(0), NextOp::Terminal),
+            CvsdSampleStartStereo => (OperandRule::Fixed(3), NextOp::Embedded),
+            CvsdSampleStart => (OperandRule::Fixed(2), NextOp::Embedded),
+            TimingAdvance | NoteTimingCombined | FmKeyOnComplex => {
+                (OperandRule::KeyCodeTiming, NextOp::Embedded)
+            }
+            NoteOnTiming => (OperandRule::Fixed(2), NextOp::Embedded),
+            FmPatchLoad => (OperandRule::Fixed(1), NextOp::Embedded),
+            PushPitchTable | PushPitchTableAlt => (OperandRule::Fixed(1), NextOp::Embedded),
+            RepeatLoop | RepeatLoopAlt => (OperandRule::Fixed(0), NextOp::Embedded),
+            SetAbsolutePitch => (OperandRule::Fixed(1), NextOp::Embedded),
+            TriggerSubSound => (OperandRule::Fixed(1), NextOp::Embedded),
+            GapNop11 | GapNop16 | GapNop20 => (OperandRule::Fixed(0), NextOp::Terminal),
+            InjectCmdRerun => (OperandRule::Fixed(1), NextOp::Terminal),
+            SubroutineCall => (OperandRule::Fixed(2), NextOp::Branch),
+            SubroutineReturn => (OperandRule::Fixed(0), NextOp::Branch),
+            FmKeyOff => (OperandRule::Fixed(0), NextOp::Terminal),
+            CvsdFmNoteOnAbs | CvsdVoiceUpdate | CvsdFmNoteOnDelta => {
+                (OperandRule::Fixed(2), NextOp::Embedded)
+            }
+            CvsdVibrato => (OperandRule::Fixed(4), NextOp::Embedded),
+            Detune => (OperandRule::Fixed(2), NextOp::Embedded),
+            PitchGlide => (OperandRule::Fixed(10), NextOp::Embedded),
+            StopDacCvsd => (OperandRule::Fixed(0), NextOp::Terminal),
+            CvsdVolumeFade | SendStatusToCpu => (OperandRule::Fixed(1), NextOp::Embedded),
+            SetChannelTiming => (OperandRule::Fixed(2), NextOp::Embedded),
+            FmKeyOnWithTiming => (OperandRule::Fixed(0), NextOp::Embedded),
+            AddTimingDelta | FmPitchDeltaTableB | FmPitchDeltaTableA | FmPitchAbsTableB
+            | FmPitchAbsTableA | GlobalPitchSlideHi | GlobalPitchSlideLo | SetGlobalPitchAbsHi
+            | SetGlobalPitchAbsLo => (OperandRule::Fixed(2), NextOp::Embedded),
+            NoteTriggerRepeat => (OperandRule::Fixed(4), NextOp::Embedded),
+            SetStereoMask | ClearChannelMask => (OperandRule::Fixed(0), NextOp::Embedded),
+            IndirectOpcodeLoad => (OperandRule::Fixed(2), NextOp::Branch),
+            InjectCmdRingBuf | CvsdSamplePlayback => (OperandRule::Fixed(1), NextOp::Embedded),
+            TimingAdvanceAlt => (OperandRule::Fixed(1), NextOp::Embedded),
+            ProgramChange => (OperandRule::Fixed(2), NextOp::Embedded),
+            PushPitchTable4b => (OperandRule::Fixed(3), NextOp::Embedded),
+            SetVolumeAbs | VolumeFadeRel => (OperandRule::Fixed(1), NextOp::Embedded),
+            UpdateNoteRegister | NoteRegisterDelta => (OperandRule::Fixed(1), NextOp::Embedded),
+            FreeVoiceEnd => (OperandRule::Fixed(0), NextOp::Terminal),
+            SetBankSwitch => (OperandRule::Fixed(1), NextOp::Embedded),
+        };
+        OpcodeInfo { operands, next }
     }
 }
 
@@ -408,10 +415,122 @@ pub struct DecodedSequence {
     pub start_addr: u16,
     /// Decoded instructions.
     pub instructions: Vec<SeqInstruction>,
-    /// Whether decoding completed normally (terminal opcode reached).
-    pub complete: bool,
-    /// Reason for incomplete decoding.
-    pub truncation: Option<String>,
+    /// Whether decoding reached a terminal opcode, or why it did not.
+    pub status: DecodeStatus,
+}
+
+/// The bank register and logical 6809 address of a sequence byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SequenceCursor {
+    pub bank: u8,
+    pub address: u16,
+}
+
+/// Final state of sequence decoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeStatus {
+    Complete,
+    Incomplete(SequenceIssue),
+}
+
+/// A checked failure that prevented a sequence from being decoded completely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SequenceIssue {
+    RomAccess {
+        cursor: SequenceCursor,
+        message: String,
+    },
+    InvalidTarget {
+        opcode: SeqOpcode,
+        cursor: SequenceCursor,
+        target: u16,
+        message: String,
+    },
+    InvalidBank {
+        cursor: SequenceCursor,
+        selector: u8,
+        message: String,
+    },
+    AddressOverflow {
+        cursor: SequenceCursor,
+    },
+    UnknownOpcode {
+        cursor: SequenceCursor,
+        raw_opcode: u8,
+    },
+    Cycle {
+        cursor: SequenceCursor,
+    },
+    CallDepthOverflow {
+        cursor: SequenceCursor,
+        maximum: usize,
+    },
+    InstructionLimit {
+        limit: usize,
+    },
+    AmbiguousLength {
+        opcode: SeqOpcode,
+        cursor: SequenceCursor,
+    },
+}
+
+impl fmt::Display for SequenceIssue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RomAccess { cursor, message } => write!(
+                f,
+                "ROM access at bank {:#04x}, address {:#06x}: {message}",
+                cursor.bank, cursor.address
+            ),
+            Self::InvalidTarget {
+                opcode,
+                cursor,
+                target,
+                message,
+            } => write!(
+                f,
+                "invalid {opcode:?} target {target:#06x} from bank {:#04x}, address {:#06x}: {message}",
+                cursor.bank, cursor.address
+            ),
+            Self::InvalidBank {
+                cursor,
+                selector,
+                message,
+            } => write!(
+                f,
+                "invalid bank selector {selector:#04x} at bank {:#04x}, address {:#06x}: {message}",
+                cursor.bank, cursor.address
+            ),
+            Self::AddressOverflow { cursor } => write!(
+                f,
+                "sequence address overflow after bank {:#04x}, address {:#06x}",
+                cursor.bank, cursor.address
+            ),
+            Self::UnknownOpcode { cursor, raw_opcode } => write!(
+                f,
+                "unknown opcode {raw_opcode:#04x} at bank {:#04x}, address {:#06x}",
+                cursor.bank, cursor.address
+            ),
+            Self::Cycle { cursor } => write!(
+                f,
+                "sequence cycle at bank {:#04x}, address {:#06x}",
+                cursor.bank, cursor.address
+            ),
+            Self::CallDepthOverflow { cursor, maximum } => write!(
+                f,
+                "call depth exceeds {maximum} at bank {:#04x}, address {:#06x}",
+                cursor.bank, cursor.address
+            ),
+            Self::InstructionLimit { limit } => {
+                write!(f, "instruction limit of {limit} reached")
+            }
+            Self::AmbiguousLength { opcode, cursor } => write!(
+                f,
+                "ambiguous operand length for {opcode:?} at bank {:#04x}, address {:#06x}",
+                cursor.bank, cursor.address
+            ),
+        }
+    }
 }
 
 const MAX_INSTRUCTIONS: usize = 500;
@@ -425,71 +544,56 @@ fn decode_sequence(
     header: &RomHeader,
 ) -> DecodedSequence {
     let mut instructions = Vec::new();
-    let mut call_stack: Vec<usize> = Vec::new();
-
-    let start_file = match header.to_file_offset(start_addr) {
-        Ok(offset) => offset,
-        Err(error) => {
-            return DecodedSequence {
-                channel: channel.to_string(),
-                start_addr,
-                instructions,
-                complete: false,
-                truncation: Some(error.to_string()),
-            };
-        }
+    let mut call_stack: Vec<SequenceCursor> = Vec::new();
+    let mut visited = HashSet::new();
+    let start_cursor = SequenceCursor {
+        bank: wpc89::SYSTEM_BANK,
+        address: start_addr,
     };
-
-    // The first byte of the sequence is the initial opcode.
-    let Some(mut current_op_raw) = u18.get(start_file).copied() else {
-        return DecodedSequence {
-            channel: channel.to_string(),
-            start_addr,
-            instructions,
-            complete: false,
-            truncation: Some("start address out of bounds".into()),
-        };
+    let (mut current_op_raw, mut cursor) = match fetch_opcode(u18, header, start_cursor) {
+        Ok(value) => value,
+        Err(issue) => return incomplete_sequence(channel, start_addr, instructions, issue),
     };
-    let mut data_pos = start_file.saturating_add(1); // data pointer (past initial opcode)
-    let mut stream_offset: usize = 0; // byte offset within the stream for display
+    let mut opcode_cursor = start_cursor;
+    let mut stream_offset = 0usize;
 
     for _ in 0..MAX_INSTRUCTIONS {
-        let opcode = match SeqOpcode::from_u8(current_op_raw) {
-            Some(op) => op,
-            None => {
-                return DecodedSequence {
-                    channel: channel.to_string(),
-                    start_addr,
-                    instructions,
-                    complete: false,
-                    truncation: Some(format!("unknown opcode 0x{:02X}", current_op_raw)),
-                };
-            }
+        if !visited.insert((cursor, current_op_raw, call_stack.clone())) {
+            return incomplete_sequence(
+                channel,
+                start_addr,
+                instructions,
+                SequenceIssue::Cycle {
+                    cursor: opcode_cursor,
+                },
+            );
+        }
+
+        let Some(opcode) = SeqOpcode::from_u8(current_op_raw) else {
+            return incomplete_sequence(
+                channel,
+                start_addr,
+                instructions,
+                SequenceIssue::UnknownOpcode {
+                    cursor: opcode_cursor,
+                    raw_opcode: current_op_raw,
+                },
+            );
+        };
+        let info = opcode.operand_info();
+        let operand_count = match operand_count(u18, header, opcode, cursor, info.operands) {
+            Ok(count) => count,
+            Err(issue) => return incomplete_sequence(channel, start_addr, instructions, issue),
         };
 
-        let (primary, alternate, next_behavior) = opcode.operand_info();
-
-        match next_behavior {
+        match info.next {
             NextOp::Terminal => {
-                let byte_count = primary;
-                let Some(end) = data_pos.checked_add(byte_count) else {
-                    return incomplete_sequence(
-                        channel,
-                        start_addr,
-                        instructions,
-                        "terminal range overflow",
-                    );
+                let (operands, _) = match read_bytes(u18, header, cursor, operand_count) {
+                    Ok(value) => value,
+                    Err(issue) => {
+                        return incomplete_sequence(channel, start_addr, instructions, issue);
+                    }
                 };
-                let Some(bytes) = u18.get(data_pos..end) else {
-                    return DecodedSequence {
-                        channel: channel.to_string(),
-                        start_addr,
-                        instructions,
-                        complete: false,
-                        truncation: Some("truncated at terminal".into()),
-                    };
-                };
-                let operands = bytes.to_vec();
                 instructions.push(SeqInstruction {
                     pos: stream_offset,
                     raw_opcode: current_op_raw,
@@ -500,173 +604,96 @@ fn decode_sequence(
                     channel: channel.to_string(),
                     start_addr,
                     instructions,
-                    complete: true,
-                    truncation: None,
+                    status: DecodeStatus::Complete,
                 };
             }
-
-            NextOp::Branch => {
-                match opcode {
-                    SeqOpcode::SubroutineCall => {
-                        let Some(operand_bytes) = data_pos
-                            .checked_add(2)
-                            .and_then(|end| u18.get(data_pos..end))
-                        else {
-                            return DecodedSequence {
-                                channel: channel.to_string(),
-                                start_addr,
-                                instructions,
-                                complete: false,
-                                truncation: Some("truncated at call".into()),
-                            };
-                        };
-                        let target_addr = match wpc89::read_be_u16(u18, data_pos) {
-                            Ok(addr) => addr,
-                            Err(error) => {
+            NextOp::Branch => match opcode {
+                SeqOpcode::SubroutineCall | SeqOpcode::IndirectOpcodeLoad => {
+                    let (operands, after_target) =
+                        match read_bytes(u18, header, cursor, operand_count) {
+                            Ok(value) => value,
+                            Err(issue) => {
                                 return incomplete_sequence(
                                     channel,
                                     start_addr,
                                     instructions,
-                                    &error.to_string(),
+                                    issue,
                                 );
                             }
                         };
-                        instructions.push(SeqInstruction {
-                            pos: stream_offset,
-                            raw_opcode: current_op_raw,
-                            opcode,
-                            operands: operand_bytes.to_vec(),
-                        });
+                    let target_addr = u16::from_be_bytes([operands[0], operands[1]]);
+                    instructions.push(SeqInstruction {
+                        pos: stream_offset,
+                        raw_opcode: current_op_raw,
+                        opcode,
+                        operands,
+                    });
 
-                        // Push return address (byte after the 2-byte target operand).
-                        let return_pos = data_pos.saturating_add(2);
+                    if opcode == SeqOpcode::SubroutineCall {
                         if call_stack.len() >= MAX_CALL_DEPTH {
-                            return DecodedSequence {
-                                channel: channel.to_string(),
+                            return incomplete_sequence(
+                                channel,
                                 start_addr,
                                 instructions,
-                                complete: false,
-                                truncation: Some("call stack overflow".into()),
-                            };
+                                SequenceIssue::CallDepthOverflow {
+                                    cursor: opcode_cursor,
+                                    maximum: MAX_CALL_DEPTH,
+                                },
+                            );
                         }
-                        call_stack.push(return_pos);
-                        stream_offset += 3; // opcode position + 2 operand bytes consumed
-
-                        // Jump to target.
-                        let target_file = match header.to_file_offset(target_addr) {
-                            Ok(offset) => offset,
-                            Err(error) => {
-                                return incomplete_sequence(
-                                    channel,
-                                    start_addr,
-                                    instructions,
-                                    &format!("call target: {error}"),
-                                );
-                            }
-                        };
-                        let Some(target_opcode) = u18.get(target_file).copied() else {
-                            return DecodedSequence {
-                                channel: channel.to_string(),
-                                start_addr,
-                                instructions,
-                                complete: false,
-                                truncation: Some(format!(
-                                    "call target 0x{:04X} out of bounds",
-                                    target_addr
-                                )),
-                            };
-                        };
-                        current_op_raw = target_opcode;
-                        data_pos = target_file.saturating_add(1);
+                        call_stack.push(after_target);
                     }
-                    SeqOpcode::SubroutineReturn => {
-                        instructions.push(SeqInstruction {
-                            pos: stream_offset,
-                            raw_opcode: current_op_raw,
-                            opcode,
-                            operands: vec![],
-                        });
-
-                        if let Some(ret_pos) = call_stack.pop() {
-                            let Some(return_opcode) = u18.get(ret_pos).copied() else {
-                                return DecodedSequence {
-                                    channel: channel.to_string(),
-                                    start_addr,
-                                    instructions,
-                                    complete: false,
-                                    truncation: Some("return address out of bounds".into()),
-                                };
-                            };
-                            // The byte at ret_pos is the next opcode.
-                            current_op_raw = return_opcode;
-                            data_pos = ret_pos.saturating_add(1);
-                            stream_offset += 1;
-                        } else {
-                            // Empty call stack — treat as terminal.
-                            return DecodedSequence {
-                                channel: channel.to_string(),
-                                start_addr,
-                                instructions,
-                                complete: true,
-                                truncation: None,
-                            };
-                        }
-                    }
-                    _ => {
-                        // IndirectOpcodeLoad or other branch — stop decoding.
-                        let byte_count = primary;
-                        let end = data_pos.saturating_add(byte_count).min(u18.len());
-                        let operands = u18.get(data_pos..end).unwrap_or_default().to_vec();
-                        instructions.push(SeqInstruction {
-                            pos: stream_offset,
-                            raw_opcode: current_op_raw,
-                            opcode,
-                            operands,
-                        });
-                        return DecodedSequence {
-                            channel: channel.to_string(),
-                            start_addr,
-                            instructions,
-                            complete: true,
-                            truncation: None,
-                        };
-                    }
-                }
-            }
-
-            NextOp::Embedded => {
-                // Determine byte count — try primary, then alternate if available.
-                let byte_count = resolve_variable_size(u18, data_pos, primary, alternate);
-
-                let Some(end) = data_pos.checked_add(byte_count) else {
-                    return incomplete_sequence(
-                        channel,
-                        start_addr,
-                        instructions,
-                        "operand range overflow",
-                    );
-                };
-                let Some(all_bytes) = u18.get(data_pos..end) else {
-                    return DecodedSequence {
-                        channel: channel.to_string(),
-                        start_addr,
-                        instructions,
-                        complete: false,
-                        truncation: Some("truncated".into()),
+                    stream_offset = stream_offset.saturating_add(operand_count + 1);
+                    let target_cursor = SequenceCursor {
+                        bank: cursor.bank,
+                        address: target_addr,
                     };
-                };
-                if byte_count == 0 {
-                    return incomplete_sequence(
-                        channel,
-                        start_addr,
-                        instructions,
-                        "zero-length operand rule",
-                    );
+                    (current_op_raw, cursor) = match fetch_opcode(u18, header, target_cursor) {
+                        Ok(value) => value,
+                        Err(issue) => {
+                            return incomplete_sequence(
+                                channel,
+                                start_addr,
+                                instructions,
+                                SequenceIssue::InvalidTarget {
+                                    opcode,
+                                    cursor: opcode_cursor,
+                                    target: target_addr,
+                                    message: issue.to_string(),
+                                },
+                            );
+                        }
+                    };
+                    opcode_cursor = target_cursor;
                 }
-                // Data operands are all bytes except the last (which is the next opcode).
-                let operands = all_bytes[..byte_count - 1].to_vec();
-                let next_op_raw = all_bytes[byte_count - 1];
-
+                SeqOpcode::SubroutineReturn => {
+                    instructions.push(SeqInstruction {
+                        pos: stream_offset,
+                        raw_opcode: current_op_raw,
+                        opcode,
+                        operands: vec![],
+                    });
+                    stream_offset = stream_offset.saturating_add(1);
+                    let return_cursor = call_stack.pop().unwrap_or(cursor);
+                    (current_op_raw, cursor) = match fetch_opcode(u18, header, return_cursor) {
+                        Ok(value) => value,
+                        Err(issue) => {
+                            return incomplete_sequence(channel, start_addr, instructions, issue);
+                        }
+                    };
+                    opcode_cursor = return_cursor;
+                }
+                _ => unreachable!("all branch opcodes must be handled exhaustively"),
+            },
+            NextOp::Embedded => {
+                let (operands, after_operands) =
+                    match read_bytes(u18, header, cursor, operand_count) {
+                        Ok(value) => value,
+                        Err(issue) => {
+                            return incomplete_sequence(channel, start_addr, instructions, issue);
+                        }
+                    };
+                let bank_selector = (opcode == SeqOpcode::SetBankSwitch).then(|| operands[0]);
                 instructions.push(SeqInstruction {
                     pos: stream_offset,
                     raw_opcode: current_op_raw,
@@ -674,84 +701,130 @@ fn decode_sequence(
                     operands,
                 });
 
-                data_pos = end;
-                stream_offset = stream_offset.saturating_add(byte_count); // advance stream offset past operands + next_op
-                current_op_raw = next_op_raw;
+                let next_cursor = if let Some(selector) = bank_selector {
+                    let switched = SequenceCursor {
+                        bank: selector,
+                        address: after_operands.address,
+                    };
+                    // Validate the raw register value even if the next byte is
+                    // in fixed ROM, whose mapping otherwise ignores the bank.
+                    if let Err(error) = header.to_file_offset_in_bank(selector, 0x4000) {
+                        return incomplete_sequence(
+                            channel,
+                            start_addr,
+                            instructions,
+                            SequenceIssue::InvalidBank {
+                                cursor: opcode_cursor,
+                                selector,
+                                message: error.to_string(),
+                            },
+                        );
+                    }
+                    switched
+                } else {
+                    after_operands
+                };
+
+                (current_op_raw, cursor) = match fetch_opcode(u18, header, next_cursor) {
+                    Ok(value) => value,
+                    Err(issue) => {
+                        return incomplete_sequence(channel, start_addr, instructions, issue);
+                    }
+                };
+                opcode_cursor = next_cursor;
+                stream_offset = stream_offset.saturating_add(operand_count + 1);
             }
         }
     }
 
-    DecodedSequence {
-        channel: channel.to_string(),
+    incomplete_sequence(
+        channel,
         start_addr,
         instructions,
-        complete: false,
-        truncation: Some("max instructions reached".into()),
-    }
+        SequenceIssue::InstructionLimit {
+            limit: MAX_INSTRUCTIONS,
+        },
+    )
 }
 
 fn incomplete_sequence(
     channel: &str,
     start_addr: u16,
     instructions: Vec<SeqInstruction>,
-    reason: &str,
+    issue: SequenceIssue,
 ) -> DecodedSequence {
     DecodedSequence {
         channel: channel.to_string(),
         start_addr,
         instructions,
-        complete: false,
-        truncation: Some(reason.to_string()),
+        status: DecodeStatus::Incomplete(issue),
     }
 }
 
-/// For variable-length opcodes, try both sizes and pick the one that yields
-/// a valid subsequent opcode. Falls back to `primary` if ambiguous.
-fn resolve_variable_size(
-    data: &[u8],
-    pos: usize,
-    primary: usize,
-    alternate: Option<usize>,
-) -> usize {
-    let alt = match alternate {
-        Some(a) => a,
-        None => return primary,
-    };
+fn advance_cursor(cursor: SequenceCursor) -> Result<SequenceCursor, SequenceIssue> {
+    let address = cursor
+        .address
+        .checked_add(1)
+        .ok_or(SequenceIssue::AddressOverflow { cursor })?;
+    Ok(SequenceCursor {
+        bank: cursor.bank,
+        address,
+    })
+}
 
-    let sizes = [primary, alt];
-    for &size in &sizes {
-        let Some(end) = pos.checked_add(size) else {
-            continue;
-        };
-        if size == 0 || end > data.len() {
-            continue;
-        }
-        let Some(candidate_next) = data.get(end - 1).copied() else {
-            continue;
-        };
-        if let Some(next_op) = SeqOpcode::from_u8(candidate_next) {
-            // Lookahead: check that the instruction AFTER this one also makes sense.
-            let (next_primary, _, next_behavior) = next_op.operand_info();
-            match next_behavior {
-                NextOp::Terminal | NextOp::Branch => return size,
-                NextOp::Embedded => {
-                    let Some(next_end) = end.checked_add(next_primary) else {
-                        continue;
-                    };
-                    if next_end <= data.len() && next_primary > 0 {
-                        let Some(next_next) = data.get(next_end - 1).copied() else {
-                            continue;
-                        };
-                        if SeqOpcode::from_u8(next_next).is_some() {
-                            return size;
-                        }
-                    }
-                }
-            }
-        }
+fn read_byte(u18: &[u8], header: &RomHeader, cursor: SequenceCursor) -> Result<u8, SequenceIssue> {
+    let offset = header
+        .to_file_offset_in_bank(cursor.bank, cursor.address)
+        .map_err(|error| SequenceIssue::RomAccess {
+            cursor,
+            message: error.to_string(),
+        })?;
+    u18.get(offset)
+        .copied()
+        .ok_or_else(|| SequenceIssue::RomAccess {
+            cursor,
+            message: format!("file offset {offset:#x} is outside the ROM"),
+        })
+}
+
+fn fetch_opcode(
+    u18: &[u8],
+    header: &RomHeader,
+    cursor: SequenceCursor,
+) -> Result<(u8, SequenceCursor), SequenceIssue> {
+    let opcode = read_byte(u18, header, cursor)?;
+    Ok((opcode, advance_cursor(cursor)?))
+}
+
+fn read_bytes(
+    u18: &[u8],
+    header: &RomHeader,
+    mut cursor: SequenceCursor,
+    count: usize,
+) -> Result<(Vec<u8>, SequenceCursor), SequenceIssue> {
+    let mut bytes = Vec::with_capacity(count);
+    for _ in 0..count {
+        bytes.push(read_byte(u18, header, cursor)?);
+        cursor = advance_cursor(cursor)?;
     }
-    // If nothing validated, return primary.
-    primary
+    Ok((bytes, cursor))
+}
+
+fn operand_count(
+    u18: &[u8],
+    header: &RomHeader,
+    opcode: SeqOpcode,
+    cursor: SequenceCursor,
+    rule: OperandRule,
+) -> Result<usize, SequenceIssue> {
+    match rule {
+        OperandRule::Fixed(count) => Ok(count),
+        OperandRule::KeyCodeTiming => {
+            let key_code = read_byte(u18, header, cursor)?;
+            Ok(if key_code & 0x80 != 0 { 2 } else { 3 })
+        }
+        OperandRule::Ambiguous => Err(SequenceIssue::AmbiguousLength { opcode, cursor }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,10 +1231,9 @@ pub fn format_programs(extraction: &ProgramExtraction, header: &RomHeader) -> St
 
         for seq in &prog.sequences {
             out.push('\n');
-            let status = if seq.complete {
-                "complete"
-            } else {
-                "INCOMPLETE"
+            let status = match seq.status {
+                DecodeStatus::Complete => "complete",
+                DecodeStatus::Incomplete(_) => "INCOMPLETE",
             };
             out.push_str(&format!(
                 "  [{}] @ 0x{:04X} ({}, {} instructions)\n",
@@ -1175,8 +1247,8 @@ pub fn format_programs(extraction: &ProgramExtraction, header: &RomHeader) -> St
                 out.push_str(&format!("    {}\n", inst));
             }
 
-            if let Some(reason) = &seq.truncation {
-                out.push_str(&format!("    ; truncated: {}\n", reason));
+            if let DecodeStatus::Incomplete(issue) = &seq.status {
+                out.push_str(&format!("    ; incomplete: {}\n", issue));
             }
         }
 
@@ -1244,6 +1316,21 @@ mod tests {
             set_word(&mut rom, offset, address);
         }
         rom
+    }
+
+    fn decode_fixture(bytes: &[u8]) -> DecodedSequence {
+        let mut rom = fixture(0x4200);
+        rom[0x500..0x500 + bytes.len()].copy_from_slice(bytes);
+        let header = RomHeader::from_u18(&rom).unwrap();
+        decode_sequence(&rom, 0x4500, "FM0", &header)
+    }
+
+    fn opcodes(sequence: &DecodedSequence) -> Vec<SeqOpcode> {
+        sequence
+            .instructions
+            .iter()
+            .map(|instruction| instruction.opcode)
+            .collect()
     }
 
     #[test]
@@ -1322,5 +1409,194 @@ mod tests {
         let extraction = extract_programs(&rom).unwrap();
         assert_eq!(extraction.programs.len(), 1);
         assert!(extraction.programs[0].sequences.is_empty());
+    }
+
+    #[test]
+    fn indirect_load_fetches_target_opcode_and_continues() {
+        let mut rom = fixture(0x4200);
+        rom[0x500..0x503].copy_from_slice(&[0x32, 0x46, 0x00]);
+        rom[0x600..0x604].copy_from_slice(&[0x35, 0xAA, 0x00, 0x55]);
+        let header = RomHeader::from_u18(&rom).unwrap();
+
+        let sequence = decode_sequence(&rom, 0x4500, "FM0", &header);
+
+        assert_eq!(sequence.status, DecodeStatus::Complete);
+        assert_eq!(
+            opcodes(&sequence),
+            vec![
+                SeqOpcode::IndirectOpcodeLoad,
+                SeqOpcode::TimingAdvanceAlt,
+                SeqOpcode::EndOfSequence,
+            ]
+        );
+        assert_eq!(sequence.instructions[1].operands, [0xAA]);
+    }
+
+    #[test]
+    fn invalid_indirect_target_is_incomplete() {
+        let sequence = decode_fixture(&[0x32, 0x20, 0x00]);
+        assert!(matches!(
+            sequence.status,
+            DecodeStatus::Incomplete(SequenceIssue::InvalidTarget {
+                opcode: SeqOpcode::IndirectOpcodeLoad,
+                target: 0x2000,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_stack_return_fetches_the_following_opcode() {
+        let sequence = decode_fixture(&[0x14, 0x00, 0x55]);
+        assert_eq!(sequence.status, DecodeStatus::Complete);
+        assert_eq!(
+            opcodes(&sequence),
+            vec![SeqOpcode::SubroutineReturn, SeqOpcode::EndOfSequence]
+        );
+    }
+
+    #[test]
+    fn ordinary_call_and_return_resume_at_saved_cursor() {
+        let mut rom = fixture(0x4200);
+        rom[0x500..0x504].copy_from_slice(&[0x13, 0x46, 0x00, 0x00]);
+        rom[0x504] = 0x55;
+        rom[0x600] = 0x14;
+        let header = RomHeader::from_u18(&rom).unwrap();
+
+        let sequence = decode_sequence(&rom, 0x4500, "FM0", &header);
+
+        assert_eq!(sequence.status, DecodeStatus::Complete);
+        assert_eq!(
+            opcodes(&sequence),
+            vec![
+                SeqOpcode::SubroutineCall,
+                SeqOpcode::SubroutineReturn,
+                SeqOpcode::EndOfSequence,
+            ]
+        );
+    }
+
+    #[test]
+    fn cyclic_indirect_branch_stops_before_instruction_limit() {
+        let sequence = decode_fixture(&[0x32, 0x45, 0x00]);
+        assert!(matches!(
+            sequence.status,
+            DecodeStatus::Incomplete(SequenceIssue::Cycle { .. })
+        ));
+        assert_eq!(sequence.instructions.len(), 1);
+    }
+
+    #[test]
+    fn bank_switch_reads_selector_in_old_bank_and_opcode_in_new_bank() {
+        let mut rom = vec![0; 0x100000];
+        let system = 0xE0000;
+        for (offset, address) in [
+            (ROM_HDR_FM_PATCH_TABLE, 0x4400),
+            (ROM_HDR_DAC_SAMPLE_TABLE, 0x4400),
+            (ROM_HDR_FM_PROGRAM_TABLE, 0x4400),
+            (ROM_HDR_VOICE_TYPE_TABLE, 0x4100),
+            (ROM_HDR_CMD_DISPATCH_TABLE, 0x4200),
+            (ROM_HDR_SOUND_PROGRAM_TABLE, 0x4300),
+            (ROM_HDR_CVSD_SAMPLE_TABLE, 0x4400),
+        ] {
+            set_word(&mut rom, system + offset, address);
+        }
+        rom[system + 0x500..system + 0x503].copy_from_slice(&[0x3E, 0x7D, 0x3F]);
+        let new_bank = 0xE8000;
+        rom[new_bank + 0x502..new_bank + 0x506].copy_from_slice(&[0x35, 0xAA, 0x00, 0x55]);
+        let header = RomHeader::from_u18(&rom).unwrap();
+
+        let sequence = decode_sequence(&rom, 0x4500, "FM0", &header);
+
+        assert_eq!(sequence.status, DecodeStatus::Complete);
+        assert_eq!(
+            opcodes(&sequence),
+            vec![
+                SeqOpcode::SetBankSwitch,
+                SeqOpcode::TimingAdvanceAlt,
+                SeqOpcode::EndOfSequence,
+            ]
+        );
+        assert_eq!(sequence.instructions[0].operands, [0x7D]);
+        assert_eq!(sequence.instructions[1].operands, [0xAA]);
+
+        // Minimized sparse Twilight Zone-style bank/opcode trace regression.
+        let checksum = sequence.instructions.iter().fold(0u32, |sum, instruction| {
+            instruction.operands.iter().fold(
+                sum.wrapping_mul(33) ^ u32::from(instruction.raw_opcode),
+                |sum, byte| sum.wrapping_mul(33) ^ u32::from(*byte),
+            )
+        });
+        assert_eq!(checksum, 0x87E5_7169);
+    }
+
+    #[test]
+    fn invalid_bank_switch_selector_is_incomplete() {
+        let sequence = decode_fixture(&[0x3E, 0xA0, 0x00]);
+        assert!(matches!(
+            sequence.status,
+            DecodeStatus::Incomplete(SequenceIssue::InvalidBank { selector: 0xA0, .. })
+        ));
+    }
+
+    #[test]
+    fn key_code_bit_selects_explicit_timing_length() {
+        for opcode in [0x0A, 0x1E, 0x3A] {
+            let short = decode_fixture(&[opcode, 0x80, 0xAA, 0x00, 0x55]);
+            assert_eq!(short.status, DecodeStatus::Complete);
+            assert_eq!(short.instructions[0].operands, [0x80, 0xAA]);
+
+            let long = decode_fixture(&[opcode, 0x01, 0xAA, 0xBB, 0x00, 0x55]);
+            assert_eq!(long.status, DecodeStatus::Complete);
+            assert_eq!(long.instructions[0].operands, [0x01, 0xAA, 0xBB]);
+        }
+    }
+
+    #[test]
+    fn fixed_timing_lengths_do_not_use_opcode_lookahead() {
+        let note_on = decode_fixture(&[0x0B, 0x00, 0x35, 0x00, 0x55]);
+        assert_eq!(note_on.status, DecodeStatus::Complete);
+        assert_eq!(note_on.instructions[0].operands, [0x00, 0x35]);
+
+        let alternate = decode_fixture(&[0x35, 0x3F, 0x00, 0x55]);
+        assert_eq!(alternate.status, DecodeStatus::Complete);
+        assert_eq!(alternate.instructions[0].operands, [0x3F]);
+    }
+
+    #[test]
+    fn call_depth_overflow_is_incomplete() {
+        let mut rom = fixture(0x4200);
+        for depth in 0..=MAX_CALL_DEPTH {
+            let address = 0x4500u16 + u16::try_from(depth * 0x10).unwrap();
+            let target = address + 0x10;
+            let offset = usize::from(address - 0x4000);
+            rom[offset..offset + 3].copy_from_slice(&[0x13, (target >> 8) as u8, target as u8]);
+        }
+        let header = RomHeader::from_u18(&rom).unwrap();
+
+        let sequence = decode_sequence(&rom, 0x4500, "FM0", &header);
+
+        assert!(matches!(
+            sequence.status,
+            DecodeStatus::Incomplete(SequenceIssue::CallDepthOverflow {
+                maximum: MAX_CALL_DEPTH,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn instruction_limit_is_incomplete() {
+        let mut bytes = vec![0x30; MAX_INSTRUCTIONS + 1];
+        bytes.extend_from_slice(&[0x00, 0x55]);
+        let sequence = decode_fixture(&bytes);
+
+        assert!(matches!(
+            sequence.status,
+            DecodeStatus::Incomplete(SequenceIssue::InstructionLimit {
+                limit: MAX_INSTRUCTIONS
+            })
+        ));
+        assert_eq!(sequence.instructions.len(), MAX_INSTRUCTIONS);
     }
 }
