@@ -588,7 +588,7 @@ fn decode_sequence(
 
         match info.next {
             NextOp::Terminal => {
-                let (operands, _) = match read_bytes(u18, header, cursor, operand_count) {
+                let operands = match read_terminal_bytes(u18, header, cursor, operand_count) {
                     Ok(value) => value,
                     Err(issue) => {
                         return incomplete_sequence(channel, start_addr, instructions, issue);
@@ -808,6 +808,22 @@ fn read_bytes(
         cursor = advance_cursor(cursor)?;
     }
     Ok((bytes, cursor))
+}
+
+fn read_terminal_bytes(
+    u18: &[u8],
+    header: &RomHeader,
+    mut cursor: SequenceCursor,
+    count: usize,
+) -> Result<Vec<u8>, SequenceIssue> {
+    let mut bytes = Vec::with_capacity(count);
+    for index in 0..count {
+        bytes.push(read_byte(u18, header, cursor)?);
+        if index + 1 < count {
+            cursor = advance_cursor(cursor)?;
+        }
+    }
+    Ok(bytes)
 }
 
 fn operand_count(
@@ -1598,5 +1614,18 @@ mod tests {
             })
         ));
         assert_eq!(sequence.instructions.len(), MAX_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn terminal_operand_at_last_rom_address_completes() {
+        let mut rom = fixture(0x4200);
+        rom[0x1FFFE..].copy_from_slice(&[0x00, 0xFF]);
+        let header = RomHeader::from_u18(&rom).unwrap();
+
+        let sequence = decode_sequence(&rom, 0xFFFE, "CVSD", &header);
+
+        assert_eq!(sequence.status, DecodeStatus::Complete);
+        assert_eq!(sequence.instructions.len(), 1);
+        assert_eq!(sequence.instructions[0].operands, [0xFF]);
     }
 }
