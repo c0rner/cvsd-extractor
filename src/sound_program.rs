@@ -28,8 +28,9 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
-use anyhow::Context;
 use thiserror::Error;
 
 use crate::wpc89::{self, RomError, RomHeader};
@@ -67,6 +68,23 @@ pub enum ProgramError {
     InvalidProgramAddress { command: u8, addr: u16 },
     #[error("sound program at {addr:#06x} is truncated")]
     TruncatedProgram { addr: u16 },
+}
+
+/// Errors encountered while reading a ROM and writing its program report.
+#[derive(Debug, Error)]
+pub enum ProgramReportError {
+    #[error("failed to read U18 ROM: {path}")]
+    ReadRom {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(transparent)]
+    Rom(#[from] RomError),
+    #[error(transparent)]
+    Program(#[from] ProgramError),
+    #[error("failed to write sound-program report")]
+    Write(#[source] io::Error),
 }
 
 /// Nonfatal facts encountered while extracting otherwise valid programs.
@@ -389,14 +407,11 @@ impl fmt::Display for SeqInstruction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{:04X}: [{:02X}] {:<24}",
-            self.pos,
-            self.raw_opcode,
-            format!("{:?}", self.opcode)
+            "{:04X}: [{:02X}] {:<24?}",
+            self.pos, self.raw_opcode, self.opcode
         )?;
-        if !self.operands.is_empty() {
-            let hex: Vec<String> = self.operands.iter().map(|b| format!("{:02X}", b)).collect();
-            write!(f, " {}", hex.join(" "))?;
+        for operand in &self.operands {
+            write!(f, " {operand:02X}")?;
         }
         Ok(())
     }
@@ -1196,113 +1211,139 @@ pub fn extract_programs(u18_data: &[u8]) -> std::result::Result<ProgramExtractio
 // Display / formatting
 // ---------------------------------------------------------------------------
 
-/// Format all programs into a human-readable report string.
-pub fn format_programs(extraction: &ProgramExtraction, header: &RomHeader) -> String {
-    let mut out = String::new();
-
-    out.push_str("=== WPC-89 Sound Program Report ===\n");
-    out.push_str(&format!(
-        "Max command index: 0x{:02X}, Programs decoded: {}\n\n",
+/// Write all programs as a human-readable report.
+pub fn write_programs(
+    extraction: &ProgramExtraction,
+    header: &RomHeader,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    writeln!(out, "=== WPC-89 Sound Program Report ===")?;
+    writeln!(
+        out,
+        "Max command index: 0x{:02X}, Programs decoded: {}",
         header.max_cmd_index,
         extraction.programs.len(),
-    ));
+    )?;
+    writeln!(out)?;
 
     for prog in &extraction.programs {
-        out.push_str(&format!(
-            "--- Command 0x{:02X} (handler=0x{:02X}, voice_type=0x{:02X}) ---\n",
+        writeln!(
+            out,
+            "--- Command 0x{:02X} (handler=0x{:02X}, voice_type=0x{:02X}) ---",
             prog.command, prog.handler_id, prog.voice_type_index,
-        ));
+        )?;
 
         let desc = &prog.descriptor;
-        out.push_str(&format!("  Descriptor @ 0x{:04X}:\n", desc.addr));
+        writeln!(out, "  Descriptor @ 0x{:04X}:", desc.addr)?;
 
-        let ch_list: Vec<String> = (0..8)
-            .filter(|b| desc.fm_mask & (1 << b) != 0)
-            .map(|b| b.to_string())
-            .collect();
-        out.push_str(&format!(
-            "    FM mask: 0x{:02X} (ch {})\n",
-            desc.fm_mask,
-            if ch_list.is_empty() {
-                "none".to_string()
-            } else {
-                ch_list.join(", ")
-            },
-        ));
+        write!(out, "    FM mask: 0x{:02X} (ch ", desc.fm_mask)?;
+        let mut wrote_channel = false;
+        for channel in (0..8).filter(|bit| desc.fm_mask & (1 << bit) != 0) {
+            if wrote_channel {
+                write!(out, ", ")?;
+            }
+            write!(out, "{channel}")?;
+            wrote_channel = true;
+        }
+        if !wrote_channel {
+            write!(out, "none")?;
+        }
+        writeln!(out, ")")?;
 
         for &(ch, addr) in &desc.fm_channels {
-            out.push_str(&format!("    FM ch{} seq @ 0x{:04X}\n", ch, addr));
+            writeln!(out, "    FM ch{ch} seq @ 0x{addr:04X}")?;
         }
 
         match desc.cvsd_type {
-            0 => out.push_str("    CVSD: none\n"),
+            0 => writeln!(out, "    CVSD: none")?,
             t => {
-                out.push_str(&format!("    CVSD type: 0x{:02X}", t));
+                write!(out, "    CVSD type: 0x{t:02X}")?;
                 if let Some(addr) = desc.cvsd_seq_addr {
-                    out.push_str(&format!(", seq @ 0x{:04X}", addr));
+                    write!(out, ", seq @ 0x{addr:04X}")?;
                 }
-                out.push('\n');
+                writeln!(out)?;
             }
         }
 
         for seq in &prog.sequences {
-            out.push('\n');
+            writeln!(out)?;
             let status = match seq.status {
                 DecodeStatus::Complete => "complete",
                 DecodeStatus::Incomplete(_) => "INCOMPLETE",
             };
-            out.push_str(&format!(
-                "  [{}] @ 0x{:04X} ({}, {} instructions)\n",
+            writeln!(
+                out,
+                "  [{}] @ 0x{:04X} ({}, {} instructions)",
                 seq.channel,
                 seq.start_addr,
                 status,
                 seq.instructions.len(),
-            ));
+            )?;
 
             for inst in &seq.instructions {
-                out.push_str(&format!("    {}\n", inst));
+                writeln!(out, "    {inst}")?;
             }
 
             if let DecodeStatus::Incomplete(issue) = &seq.status {
-                out.push_str(&format!("    ; incomplete: {}\n", issue));
+                writeln!(out, "    ; incomplete: {issue}")?;
             }
         }
 
-        out.push('\n');
+        writeln!(out)?;
     }
 
     if !extraction.diagnostics.is_empty() {
-        out.push_str("=== Diagnostics ===\n");
+        writeln!(out, "=== Diagnostics ===")?;
         for diagnostic in &extraction.diagnostics {
             match diagnostic {
                 ProgramDiagnostic::UnsupportedHandler {
                     command,
                     handler_id,
                     param,
-                } => out.push_str(&format!(
-                    "Unsupported handler: command=0x{command:02X}, handler=0x{handler_id:02X}, param=0x{param:02X}\n"
-                )),
+                } => writeln!(
+                    out,
+                    "Unsupported handler: command=0x{command:02X}, handler=0x{handler_id:02X}, param=0x{param:02X}"
+                )?,
             }
         }
     }
 
-    out
+    Ok(())
 }
 
-/// Produce a brief summary of sound programs found in a ROM.
-pub fn summarise_programs(u18_path: &std::path::Path) -> anyhow::Result<String> {
-    let u18_data = std::fs::read(u18_path)
-        .with_context(|| format!("failed to read U18 ROM: {}", u18_path.display()))?;
+/// Format all programs into a human-readable report string.
+pub fn format_programs(extraction: &ProgramExtraction, header: &RomHeader) -> String {
+    let mut out = Vec::new();
+    write_programs(extraction, header, &mut out).expect("writing to a Vec cannot fail");
+    String::from_utf8(out).expect("program reports contain only UTF-8 text")
+}
+
+/// Read a U18 ROM and stream its sound-program summary.
+pub fn write_program_summary(
+    u18_path: &Path,
+    out: &mut impl Write,
+) -> Result<(), ProgramReportError> {
+    let u18_data = std::fs::read(u18_path).map_err(|source| ProgramReportError::ReadRom {
+        path: u18_path.to_path_buf(),
+        source,
+    })?;
     let header = RomHeader::from_u18(&u18_data)?;
     let extraction = extract_programs(&u18_data)?;
 
-    let mut out = String::new();
-    out.push_str(&format!(
-        "ROM: {}\n",
+    writeln!(
+        out,
+        "ROM: {}",
         u18_path.file_name().unwrap_or_default().to_string_lossy(),
-    ));
-    out.push_str(&format_programs(&extraction, &header));
-    Ok(out)
+    )
+    .map_err(ProgramReportError::Write)?;
+    write_programs(&extraction, &header, out).map_err(ProgramReportError::Write)
+}
+
+/// Produce a brief summary of sound programs found in a ROM.
+pub fn summarise_programs(u18_path: &Path) -> anyhow::Result<String> {
+    let mut out = Vec::new();
+    write_program_summary(u18_path, &mut out)?;
+    Ok(String::from_utf8(out).expect("program reports contain only UTF-8 text"))
 }
 
 #[cfg(test)]
@@ -1627,5 +1668,59 @@ mod tests {
         assert_eq!(sequence.status, DecodeStatus::Complete);
         assert_eq!(sequence.instructions.len(), 1);
         assert_eq!(sequence.instructions[0].operands, [0xFF]);
+    }
+
+    #[test]
+    fn writer_report_matches_golden_format() {
+        let rom = fixture(0x4200);
+        let header = RomHeader::from_u18(&rom).unwrap();
+        let extraction = ProgramExtraction {
+            programs: Vec::new(),
+            diagnostics: vec![ProgramDiagnostic::UnsupportedHandler {
+                command: 0x12,
+                handler_id: 0x77,
+                param: 0x55,
+            }],
+        };
+        let mut report = Vec::new();
+
+        write_programs(&extraction, &header, &mut report).unwrap();
+
+        assert_eq!(
+            String::from_utf8(report).unwrap(),
+            concat!(
+                "=== WPC-89 Sound Program Report ===\n",
+                "Max command index: 0x00, Programs decoded: 0\n",
+                "\n",
+                "=== Diagnostics ===\n",
+                "Unsupported handler: command=0x12, handler=0x77, param=0x55\n",
+            )
+        );
+    }
+
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "consumer exited"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn writer_propagates_broken_pipe() {
+        let rom = fixture(0x4200);
+        let header = RomHeader::from_u18(&rom).unwrap();
+        let extraction = ProgramExtraction {
+            programs: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let error = write_programs(&extraction, &header, &mut BrokenPipeWriter).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 }
