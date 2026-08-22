@@ -102,8 +102,12 @@ pub enum RomError {
         #[source]
         source: std::io::Error,
     },
-    #[error("CVSD table pointer {pointer:#06x} is invalid")]
-    InvalidCvsdTablePointer { pointer: u16 },
+    #[error("CVSD table pointer {pointer:#06x} is invalid: {source}")]
+    InvalidCvsdTablePointer {
+        pointer: u16,
+        #[source]
+        source: Box<RomError>,
+    },
     #[error("CVSD descriptor {index} at {addr:#06x} is truncated")]
     TruncatedCvsdDescriptor { index: usize, addr: u16 },
     #[error("CVSD descriptor {index} has invalid data range {start:#06x}..{end:#06x}")]
@@ -117,7 +121,7 @@ pub enum RomError {
         size: usize,
         rom_len: usize,
     },
-    #[error("CVSD table contains no entries")]
+    #[error("CVSD table contains no entries; check that the provided ROMs are WPC-89 sound ROMs")]
     NoCvsdEntries,
 }
 
@@ -341,11 +345,12 @@ pub fn parse_cvsd_table(roms: &RomSet) -> std::result::Result<Vec<CvsdEntry>, Ro
     let u18_data = read_rom(&roms.u18, "u18")?;
 
     let hdr = RomHeader::from_u18(&u18_data)?;
-    let cvsd_table_file = hdr.to_file_offset(hdr.cvsd_sample_table).map_err(|_| {
-        RomError::InvalidCvsdTablePointer {
+    let cvsd_table_file = hdr
+        .to_file_offset(hdr.cvsd_sample_table)
+        .map_err(|source| RomError::InvalidCvsdTablePointer {
             pointer: hdr.cvsd_sample_table,
-        }
-    })?;
+            source: Box::new(source),
+        })?;
 
     let u14_len = std::fs::metadata(&roms.u14)
         .map_err(|source| RomError::ReadRom {
@@ -721,5 +726,20 @@ mod tests {
         assert_eq!(entries[0].offset, 0);
         assert_eq!(entries[0].size, 1);
         std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn invalid_cvsd_table_pointer_preserves_mapping_error() {
+        let mut rom = header_fixture();
+        set_word(&mut rom, ROM_HDR_CVSD_SAMPLE_TABLE, 0x3FFF);
+        let header = RomHeader::from_u18(&rom).unwrap();
+        let error = header.to_file_offset(header.cvsd_sample_table).unwrap_err();
+
+        let wrapped = RomError::InvalidCvsdTablePointer {
+            pointer: header.cvsd_sample_table,
+            source: Box::new(error),
+        };
+        assert!(wrapped.to_string().contains("outside the ROM windows"));
+        assert!(std::error::Error::source(&wrapped).is_some());
     }
 }
