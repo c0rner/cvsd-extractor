@@ -527,23 +527,6 @@ pub fn chip_name(chip: RomChip) -> &'static str {
     }
 }
 
-/// Read a 16-bit big-endian pointer from a ROM header table.
-///
-/// `header_offset` is one of the `ROM_HDR_*` constants.
-/// Returns the raw 6809 address stored at that location.
-pub fn read_rom_header_ptr(
-    u18_data: &[u8],
-    system_bank_file: usize,
-    header_offset: usize,
-) -> std::result::Result<u16, RomError> {
-    let pos = system_bank_file
-        .checked_add(header_offset)
-        .ok_or(RomError::ArithmeticOverflow {
-            context: "ROM header pointer offset",
-        })?;
-    read_be_u16(u18_data, pos)
-}
-
 /// Compute the file offset of the system bank (U18 page 0x1C) within a U18 ROM.
 ///
 /// The system bank always occupies the last 0x20000 bytes of the U18 image.
